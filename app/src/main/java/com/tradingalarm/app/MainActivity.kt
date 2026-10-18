@@ -12,7 +12,7 @@ import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.Uri
 import android.graphics.Paint as AndroidPaint
-import android.graphics.BitmapFactory
+import android.widget.ImageView
 import android.os.Build
 import android.os.Bundle
 import android.security.keystore.KeyGenParameterSpec
@@ -37,7 +37,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -65,10 +64,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.LayoutDirection
@@ -401,11 +399,15 @@ private fun TradingAlarmScreen() {
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Image(
-                                painter = painterResource(id = R.drawable.trading_alarm_logo),
-                                contentDescription = "نشان Trading Alarm",
-                                modifier = Modifier.size(108.dp),
-                                contentScale = ContentScale.Crop
+                            AndroidView(
+                                factory = { viewContext ->
+                                    ImageView(viewContext).apply {
+                                        setImageResource(R.mipmap.ic_launcher)
+                                        scaleType = ImageView.ScaleType.FIT_CENTER
+                                        contentDescription = "نشان Trading Alarm"
+                                    }
+                                },
+                                modifier = Modifier.size(108.dp)
                             )
                             Column(
                                 modifier = Modifier.weight(1f),
@@ -1427,7 +1429,6 @@ private fun sendSignalNotification(context: Context, signal: StrategySignal, sym
 
     val notification = builder
         .setSmallIcon(android.R.drawable.ic_dialog_info)
-        .setLargeIcon(BitmapFactory.decodeResource(context.resources, R.drawable.trading_alarm_logo))
         .setContentTitle("Trading Alarm")
         .setContentText(firstLine)
         .setStyle(Notification.BigTextStyle().bigText(alertText))
@@ -1462,7 +1463,6 @@ private fun sendTestNotification(context: Context, soundUriString: String?) {
 
     val notification = builder
         .setSmallIcon(android.R.drawable.ic_dialog_info)
-        .setLargeIcon(BitmapFactory.decodeResource(context.resources, R.drawable.trading_alarm_logo))
         .setContentTitle("Trading Alarm")
         .setContentText(firstLine)
         .setStyle(Notification.BigTextStyle().bigText(sampleText))
