@@ -1,12 +1,18 @@
 package com.tradingalarm.app
 
 import android.Manifest
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.RingtoneManager
+import android.net.Uri
 import android.graphics.Paint as AndroidPaint
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
 import android.security.keystore.KeyGenParameterSpec
@@ -14,7 +20,10 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -28,6 +37,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -35,6 +45,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
@@ -54,6 +65,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -91,7 +104,9 @@ private const val KEY_ALIAS = "TradingAlarmTwelveDataAesKey"
 private const val SIGNAL_PREFS = "trading_alarm_signal_state"
 private const val LAST_SIGNAL_TIME_KEY = "last_signal_activation_time"
 private const val SIGNAL_BASELINE_SET_KEY = "signal_baseline_set"
-private const val NOTIFICATION_CHANNEL_ID = "trading_alarm_signals"
+private const val NOTIFICATION_PREFS = "trading_alarm_notification_settings"
+private const val NOTIFICATION_SOUND_URI_KEY = "notification_sound_uri"
+private const val NOTIFICATION_CHANNEL_PREFIX = "trading_alarm_signals"
 private const val M5_MS = 5L * 60L * 1000L
 private const val M15_MS = 15L * 60L * 1000L
 private const val H1_MS = 60L * 60L * 1000L
@@ -191,7 +206,7 @@ private data class PairAnalysisResult(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        createNotificationChannel(this)
+        createNotificationChannel(this, loadSavedNotificationSoundUri(this))
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -211,7 +226,53 @@ private fun TradingAlarmScreen() {
     var isLoading by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("کلید API را بارگذاری یا وارد کن؛ سپس «بررسی استراتژی» را بزن.") }
     var lastSuccess by remember { mutableStateOf(false) }
+    var notificationSoundUri by remember {
+        mutableStateOf(loadSavedNotificationSoundUri(context))
+    }
+    var notificationSoundLabel by remember {
+        mutableStateOf(resolveNotificationSoundLabel(context, loadSavedNotificationSoundUri(context)))
+    }
     val scope = rememberCoroutineScope()
+
+    val soundPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            @Suppress("DEPRECATION")
+            val pickedUri = result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+            val pickedValue = pickedUri?.toString()
+            saveNotificationSoundUri(context, pickedValue)
+            notificationSoundUri = pickedValue
+            notificationSoundLabel = resolveNotificationSoundLabel(context, pickedValue)
+            createNotificationChannel(context, pickedValue)
+            status = "صدای اعلان Trading Alarm تغییر کرد: $notificationSoundLabel"
+        }
+    }
+
+    fun openNotificationSoundPicker() {
+        val existingUri = notificationSoundUri?.let { Uri.parse(it) }
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "انتخاب صدای اختصاصی Trading Alarm")
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, false)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, existingUri)
+        }
+        soundPickerLauncher.launch(intent)
+    }
+
+    fun resetNotificationSound() {
+        saveNotificationSoundUri(context, null)
+        notificationSoundUri = null
+        notificationSoundLabel = "صدای پیش‌فرض اندروید"
+        createNotificationChannel(context, null)
+        status = "صدای اعلان به صدای پیش‌فرض اندروید برگشت."
+    }
+
+    fun testNotificationSound() {
+        playNotificationSound(context, notificationSoundUri)
+    }
 
     LaunchedEffect(Unit) {
         try {
@@ -334,8 +395,39 @@ private fun TradingAlarmScreen() {
                     modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text("Trading Alarm", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.primary)
-                    Text("Williams Gate + EMA 6/11 + M15 Rectangle + M5 MSB", style = MaterialTheme.typography.titleMedium)
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Image(
+                                painter = painterResource(id = R.drawable.trading_alarm_logo),
+                                contentDescription = "نشان Trading Alarm",
+                                modifier = Modifier.size(108.dp),
+                                contentScale = ContentScale.Crop
+                            )
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Text(
+                                    "Trading Alarm",
+                                    style = MaterialTheme.typography.headlineMedium,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    "Williams Gate + EMA 6/11 + M15 Rectangle + M5 MSB",
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                Text(
+                                    "AUD/USD · NZD/USD",
+                                    color = MaterialTheme.colorScheme.secondary,
+                                    style = MaterialTheme.typography.labelLarge
+                                )
+                            }
+                        }
+                    }
                     Text(
                         "منطق استراتژی برای AUD/USD و NZD/USD جداگانه اجرا می‌شود. چارت‌ها پایین صفحه به‌صورت مستقل نمایش داده می‌شوند؛ اپ معامله باز نمی‌کند.",
                         style = MaterialTheme.typography.bodyMedium,
@@ -355,6 +447,67 @@ private fun TradingAlarmScreen() {
                             Text(if (apiKeyLoaded && apiKey.isNotBlank()) "کلید ذخیره‌شده بارگذاری شده است." else "بعد از بررسی موفق، کلید به‌صورت رمزگذاری‌شده روی همین گوشی ذخیره می‌شود.")
                         }
                     )
+
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                "صدای اختصاصی اعلان",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                "صدای فعلی: $notificationSoundLabel",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { openNotificationSoundPicker() },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("انتخاب صدا")
+                                }
+                                OutlinedButton(
+                                    onClick = { resetNotificationSound() },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("صدای پیش‌فرض")
+                                }
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { testNotificationSound() },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("پخش صدا")
+                                }
+                                OutlinedButton(
+                                    onClick = { sendTestNotification(context, notificationSoundUri) },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("تست اعلان")
+                                }
+                            }
+                            Text(
+                                "نمونه متن آلارم:\nBUY LIMIT NZDUSD AT >>>> 0.65523\nSL >>>> 0.65322",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.78f)
+                            )
+                            Text(
+                                "برای شنیدن صدای متفاوت، از انتخاب صدا استفاده کن؛ اگر صدای دلخواهت در فهرست نیست، آن را ابتدا در پوشه Ringtones گوشی قرار بده.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.62f)
+                            )
+                        }
+                    }
 
                     Button(
                         onClick = { runStrategyCheck() },
@@ -1141,14 +1294,75 @@ private fun decryptApiKey(encoded: String): String {
     return String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8)
 }
 
-private fun createNotificationChannel(context: Context) {
+private fun loadSavedNotificationSoundUri(context: Context): String? {
+    return context.getSharedPreferences(NOTIFICATION_PREFS, Context.MODE_PRIVATE)
+        .getString(NOTIFICATION_SOUND_URI_KEY, null)
+}
+
+private fun saveNotificationSoundUri(context: Context, soundUri: String?) {
+    val editor = context.getSharedPreferences(NOTIFICATION_PREFS, Context.MODE_PRIVATE).edit()
+    if (soundUri.isNullOrBlank()) {
+        editor.remove(NOTIFICATION_SOUND_URI_KEY)
+    } else {
+        editor.putString(NOTIFICATION_SOUND_URI_KEY, soundUri)
+    }
+    editor.apply()
+}
+
+private fun notificationChannelId(soundUriString: String?): String {
+    val suffix = if (soundUriString.isNullOrBlank()) {
+        "default"
+    } else {
+        Integer.toHexString(soundUriString.hashCode())
+    }
+    return "${NOTIFICATION_CHANNEL_PREFIX}_$suffix"
+}
+
+private fun resolveNotificationSoundLabel(context: Context, soundUriString: String?): String {
+    if (soundUriString.isNullOrBlank()) return "صدای پیش‌فرض اندروید"
+    return try {
+        val uri = Uri.parse(soundUriString)
+        RingtoneManager.getRingtone(context, uri)?.getTitle(context)
+            ?: "صدای انتخاب‌شده"
+    } catch (_: Exception) {
+        "صدای انتخاب‌شده"
+    }
+}
+
+private fun playNotificationSound(context: Context, soundUriString: String?) {
+    try {
+        val uri = soundUriString?.let { Uri.parse(it) }
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        RingtoneManager.getRingtone(context, uri)?.play()
+    } catch (_: Exception) {
+        // A sound preview must not crash the app if the chosen URI is no longer available.
+    }
+}
+
+private fun createNotificationChannel(context: Context, soundUriString: String? = loadSavedNotificationSoundUri(context)) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channelId = notificationChannelId(soundUriString)
+        if (manager.getNotificationChannel(channelId) != null) return
+
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        val soundUri = soundUriString?.let { Uri.parse(it) }
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
+        val chosenSoundName = resolveNotificationSoundLabel(context, soundUriString)
         val channel = NotificationChannel(
-            NOTIFICATION_CHANNEL_ID,
-            "Trading Alarm signals",
+            channelId,
+            "Trading Alarm · $chosenSoundName",
             NotificationManager.IMPORTANCE_DEFAULT
-        ).apply { description = "BUY/SELL rectangle signals from the configured strategy" }
+        ).apply {
+            description = "BUY/SELL rectangle signals from Trading Alarm"
+            setSound(soundUri, audioAttributes)
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0L, 250L, 150L, 350L)
+        }
         manager.createNotificationChannel(channel)
     }
 }
@@ -1182,24 +1396,80 @@ private fun registerNewSignalIfNeeded(
 }
 
 private fun sendSignalNotification(context: Context, signal: StrategySignal, symbol: String) {
-    if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+    if (Build.VERSION.SDK_INT >= 33 &&
+        context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    ) return
+
+    val soundUriString = loadSavedNotificationSoundUri(context)
+    createNotificationChannel(context, soundUriString)
     val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val channelId = notificationChannelId(soundUriString)
+    val soundUri = soundUriString?.let { Uri.parse(it) }
+        ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
     val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        Notification.Builder(context, NOTIFICATION_CHANNEL_ID)
+        Notification.Builder(context, channelId)
     } else {
         @Suppress("DEPRECATION")
-        Notification.Builder(context)
+        Notification.Builder(context).setSound(soundUri)
     }
-    val text = "${directionName(signal.direction)} · $symbol · مستطیل M15"
+
+    // Rectangle levels define the limit entry and stop loss:
+    // BUY LIMIT enters at the rectangle top with SL at its bottom.
+    // SELL LIMIT enters at the rectangle bottom with SL at its top.
+    val pair = symbol.replace("/", "").replace(" ", "").uppercase(Locale.US)
+    val isBuy = signal.direction == 1
+    val orderType = if (isBuy) "BUY LIMIT" else "SELL LIMIT"
+    val entryPrice = if (isBuy) signal.top else signal.bottom
+    val stopLossPrice = if (isBuy) signal.bottom else signal.top
+    val alertText = "$orderType $pair AT >>>> ${formatPrice(entryPrice)}\nSL >>>> ${formatPrice(stopLossPrice)}"
+    val firstLine = "$orderType $pair AT >>>> ${formatPrice(entryPrice)}"
+
     val notification = builder
         .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setLargeIcon(BitmapFactory.decodeResource(context.resources, R.drawable.trading_alarm_logo))
         .setContentTitle("Trading Alarm")
-        .setContentText(text)
-        .setStyle(Notification.BigTextStyle().bigText("${text}\nزمان: ${formatUtc(signal.activationTime)}\nقیمت بالا: ${formatPrice(signal.top)} · قیمت پایین: ${formatPrice(signal.bottom)}"))
+        .setContentText(firstLine)
+        .setStyle(Notification.BigTextStyle().bigText(alertText))
+        .setCategory(Notification.CATEGORY_ALARM)
         .setAutoCancel(true)
         .build()
+
     val notificationId = if (symbol == "AUD/USD") 4102 else 4103
     manager.notify(notificationId, notification)
+}
+
+private fun sendTestNotification(context: Context, soundUriString: String?) {
+    if (Build.VERSION.SDK_INT >= 33 &&
+        context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    ) return
+
+    createNotificationChannel(context, soundUriString)
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val channelId = notificationChannelId(soundUriString)
+    val soundUri = soundUriString?.let { Uri.parse(it) }
+        ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
+    val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Notification.Builder(context, channelId)
+    } else {
+        @Suppress("DEPRECATION")
+        Notification.Builder(context).setSound(soundUri)
+    }
+
+    val firstLine = "BUY LIMIT NZDUSD AT >>>> 0.65523"
+    val sampleText = "$firstLine\nSL >>>> 0.65322"
+
+    val notification = builder
+        .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setLargeIcon(BitmapFactory.decodeResource(context.resources, R.drawable.trading_alarm_logo))
+        .setContentTitle("Trading Alarm")
+        .setContentText(firstLine)
+        .setStyle(Notification.BigTextStyle().bigText(sampleText))
+        .setAutoCancel(true)
+        .build()
+
+    manager.notify(4199, notification)
 }
 
 private fun directionName(direction: Int): String = when (direction) {
