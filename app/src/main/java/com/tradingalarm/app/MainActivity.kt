@@ -1222,7 +1222,7 @@ private fun CandleChart(
                             size.width.toFloat() - 8.dp.toPx() - 76.dp.toPx()
                         ).coerceAtLeast(1f)
                         val candleStepPx = chartWidthPx / effectiveCount.toFloat()
-                        accumulatedDragPx += dragAmount.x
+                        accumulatedDragPx += dragAmount
                         val barsMoved = (accumulatedDragPx / candleStepPx).toInt()
                         if (barsMoved != 0) {
                             val allowedOffset = (candles.size - effectiveCount).coerceAtLeast(0)
