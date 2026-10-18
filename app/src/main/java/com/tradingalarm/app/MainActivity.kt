@@ -1885,3 +1885,282 @@ private fun requestedOutputSize(interval: String): Int = when (interval) {
 }
 
 private fun urlEncode(value: String): String = URLEncoder.encode(value, "UTF-8")
+private const val MONITOR_CHANNEL_ID = "trading_alarm_monitoring"
+private const val MONITOR_NOTIFICATION_ID = 4001
+private const val MONITOR_INTERVAL_MS = 15L * 60L * 1000L
+
+class TradingAlarmService : Service() {
+
+    private val serviceScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override fun onCreate() {
+        super.onCreate()
+
+        createMonitoringChannel()
+
+        // Android requires a foreground notification promptly.
+        startForeground(
+            MONITOR_NOTIFICATION_ID,
+            buildMonitoringNotification(
+                "در حال آماده‌سازی مانیتورینگ بازار..."
+            )
+        )
+
+        serviceScope.launch {
+            monitoringLoop()
+        }
+    }
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    private fun createMonitoringChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(
+                Context.NOTIFICATION_SERVICE
+            ) as NotificationManager
+
+            if (manager.getNotificationChannel(
+                    MONITOR_CHANNEL_ID
+                ) == null
+            ) {
+                val channel = NotificationChannel(
+                    MONITOR_CHANNEL_ID,
+                    "Trading Alarm Monitoring",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description =
+                        "وضعیت مانیتورینگ پس‌زمینه بازار"
+                    setShowBadge(false)
+                    enableVibration(false)
+                }
+
+                manager.createNotificationChannel(channel)
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun buildMonitoringNotification(
+        message: String
+    ): Notification {
+
+        val builder =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Notification.Builder(this, MONITOR_CHANNEL_ID)
+            } else {
+                Notification.Builder(this)
+                    .setPriority(Notification.PRIORITY_LOW)
+            }
+
+        return builder
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("Trading Alarm · مانیتورینگ")
+            .setContentText(message)
+            .setStyle(
+                Notification.BigTextStyle()
+                    .bigText(message)
+            )
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+    }
+
+    private fun updateMonitoringNotification(
+        message: String
+    ) {
+        startForeground(
+            MONITOR_NOTIFICATION_ID,
+            buildMonitoringNotification(message)
+        )
+    }
+
+    private suspend fun monitoringLoop() {
+
+        while (currentCoroutineContext().isActive) {
+
+            try {
+
+                // Avoid spending API credits outside forex hours.
+                if (!isWithinUsualForexSession(
+                        System.currentTimeMillis()
+                    )
+                ) {
+                    updateMonitoringNotification(
+                        "مانیتورینگ فعال است؛ بازار فارکس بسته است."
+                    )
+
+                } else {
+
+                    val apiKey = loadSavedApiKey(
+                        applicationContext
+                    )
+
+                    if (apiKey.isBlank()) {
+
+                        updateMonitoringNotification(
+                            "کلید API ذخیره نشده است. اپ را باز کن و یک بررسی موفق انجام بده."
+                        )
+
+                    } else {
+
+                        updateMonitoringNotification(
+                            "در حال دریافت و پردازش داده‌های AUD/USD و NZD/USD..."
+                        )
+
+                        // Reuse the existing analysis engine.
+                        val pairResults = listOf(
+                            analyzePairForSymbol(
+                                apiKey,
+                                "AUD/USD"
+                            ),
+                            analyzePairForSymbol(
+                                apiKey,
+                                "NZD/USD"
+                            )
+                        )
+
+                        val successfulPairs =
+                            pairResults.filter {
+                                it.analysis != null
+                            }
+
+                        if (successfulPairs.isEmpty()) {
+
+                            val errors = pairResults.joinToString(
+                                "\n"
+                            ) {
+                                "${it.symbol}: ${
+                                    it.error ?: "خطای نامشخص"
+                                }"
+                            }
+
+                            updateMonitoringNotification(
+                                "دریافت داده ناموفق بود.\n$errors"
+                            )
+
+                        } else {
+
+                            val newAlerts =
+                                mutableListOf<String>()
+
+                            for (pairResult in successfulPairs) {
+
+                                val analysis =
+                                    pairResult.analysis ?: continue
+
+                                val signal =
+                                    analysis.latestSignal
+
+                                val latestClosedM15Time =
+                                    analysis.m15Candles
+                                        .lastOrNull()
+                                        ?.timeMillis
+                                        ?: System.currentTimeMillis()
+
+                                val isNewSignal =
+                                    registerNewSignalIfNeeded(
+                                        applicationContext,
+                                        pairResult.symbol,
+                                        signal,
+                                        latestClosedM15Time
+                                    )
+
+                                if (isNewSignal && signal != null) {
+
+                                    sendSignalNotification(
+                                        applicationContext,
+                                        signal,
+                                        pairResult.symbol
+                                    )
+
+                                    newAlerts.add(
+                                        "${pairResult.symbol}: ${
+                                            directionName(
+                                                signal.direction
+                                            )
+                                        }"
+                                    )
+                                }
+                            }
+
+                            val statusText = buildString {
+
+                                append("مانیتورینگ فعال است")
+                                append("\nآخرین بررسی: ")
+                                append(
+                                    formatUtc(
+                                        System.currentTimeMillis()
+                                    )
+                                )
+
+                                for (result in successfulPairs) {
+                                    append("\n")
+                                    append(result.symbol)
+                                    append(": ")
+                                    append(
+                                        result.analysis?.status
+                                            ?: "آماده"
+                                    )
+                                }
+
+                                if (newAlerts.isNotEmpty()) {
+                                    append("\nآلارم جدید: ")
+                                    append(
+                                        newAlerts.joinToString("، ")
+                                    )
+                                }
+
+                                val failedPairs =
+                                    pairResults.filter {
+                                        it.analysis == null
+                                    }
+
+                                for (failed in failedPairs) {
+                                    append("\nخطای ")
+                                    append(failed.symbol)
+                                    append(": ")
+                                    append(
+                                        failed.error
+                                            ?: "خطای نامشخص"
+                                    )
+                                }
+                            }
+
+                            updateMonitoringNotification(
+                                statusText
+                            )
+                        }
+                    }
+                }
+
+            } catch (e: CancellationException) {
+                throw e
+
+            } catch (e: Exception) {
+
+                updateMonitoringNotification(
+                    "خطای مانیتورینگ: ${
+                        e.message ?: "خطای نامشخص"
+                    }"
+                )
+            }
+
+            delay(MONITOR_INTERVAL_MS)
+        }
+    }
+}
