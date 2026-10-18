@@ -1,7 +1,13 @@
 package com.tradingalarm.app
 
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Paint as AndroidPaint
+import android.os.Build
 import android.os.Bundle
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
@@ -26,7 +32,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -72,9 +77,37 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+private const val PREFS_NAME = "trading_alarm_secure_prefs"
+private const val API_KEY_PREF = "encrypted_twelvedata_api_key"
+private const val KEY_ALIAS = "TradingAlarmTwelveDataAesKey"
+private const val SIGNAL_PREFS = "trading_alarm_signal_state"
+private const val LAST_SIGNAL_TIME_KEY = "last_signal_activation_time"
+private const val SIGNAL_BASELINE_SET_KEY = "signal_baseline_set"
+private const val NOTIFICATION_CHANNEL_ID = "trading_alarm_signals"
+private const val M5_MS = 5L * 60L * 1000L
+private const val M15_MS = 15L * 60L * 1000L
+private const val H1_MS = 60L * 60L * 1000L
+
+private const val EMA6_LENGTH = 6
+private const val EMA11_LENGTH = 11
+private const val WVF_PD = 50
+private const val WVF_BBL = 20
+private const val WVF_MULT = 5.0
+private const val WVF_LOOKBACK = 50
+private const val WVF_PERCENTILE = 0.90
+private const val MSB_ZIGZAG_LENGTH = 9
+private const val MSB_FIB_FACTOR = 0.33
+private const val M15_SEARCH_BACK_BARS = 500
+private const val PAST_SIGNALS_TO_SHOW = 5
 
 private data class Candle(
     val time: String,
+    val timeMillis: Long,
     val open: Double,
     val high: Double,
     val low: Double,
@@ -83,141 +116,154 @@ private data class Candle(
 
 private data class CandleFetchResult(
     val candles: List<Candle>,
+    val rawCount: Int,
     val removedOutsideForexSession: Int,
+    val removedUnclosed: Int,
     val requestedCount: Int
 )
 
-private const val PREFS_NAME = "trading_alarm_secure_prefs"
-private const val API_KEY_PREF = "encrypted_twelvedata_api_key"
-private const val KEY_ALIAS = "TradingAlarmTwelveDataAesKey"
+private data class H1WilliamsState(
+    val active: Boolean,
+    val greenStart: Boolean,
+    val redStart: Boolean
+)
+
+private data class M5MsbEvent(
+    val direction: Int,
+    val level: Double,
+    val startTime: Long,
+    val endTime: Long,
+    val labelTime: Long,
+    val eventTime: Long
+)
+
+private data class StrategyRectangle(
+    val direction: Int,
+    val leftIndex: Int,
+    val activationIndex: Int,
+    var rightIndex: Int,
+    val top: Double,
+    val bottom: Double,
+    val activationTime: Long,
+    var armed: Boolean,
+    var touched: Boolean
+)
+
+private data class StrategySignal(
+    val direction: Int,
+    val activationTime: Long,
+    val leftTime: Long,
+    val top: Double,
+    val bottom: Double
+)
+
+private data class ChartLine(
+    val title: String,
+    val colorArgb: Long,
+    val values: List<Double?>,
+    val widthDp: Float = 1.5f
+)
+
+private data class StrategyAnalysis(
+    val h1Candles: List<Candle>,
+    val m15Candles: List<Candle>,
+    val m5Candles: List<Candle>,
+    val rectangles: List<StrategyRectangle>,
+    val msbLines: List<M5MsbEvent>,
+    val emaLines: List<ChartLine>,
+    val latestSignal: StrategySignal?,
+    val gateReady: Boolean,
+    val pendingDirection: Int,
+    val latestM5Direction: Int,
+    val h1WilliamsEvents: Int,
+    val status: String
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        createNotificationChannel(this)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 301)
+        }
         setContent { TradingAlarmScreen() }
     }
 }
 
 @Composable
 private fun TradingAlarmScreen() {
-    val appContext = LocalContext.current.applicationContext
-
+    val context = LocalContext.current.applicationContext
     var apiKey by remember { mutableStateOf("") }
     var apiKeyLoaded by remember { mutableStateOf(false) }
-
-    var selectedInterval by rememberSaveable {
-        mutableStateOf("15min")
-    }
-
-    var chartInterval by remember {
-        mutableStateOf<String?>(null)
-    }
-
-    var candles by remember {
-        mutableStateOf<List<Candle>>(emptyList())
-    }
-
-    var isLoading by remember {
-        mutableStateOf(false)
-    }
-
-    var status by remember {
-        mutableStateOf("کلید API را وارد کن و دریافت کندل‌ها را بزن.")
-    }
-
-    var lastRequestSucceeded by remember {
-        mutableStateOf(false)
-    }
-
+    var analysis by remember { mutableStateOf<StrategyAnalysis?>(null) }
+    var isLoading by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("کلید API را بارگذاری یا وارد کن؛ سپس «بررسی استراتژی» را بزن.") }
+    var lastSuccess by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
         try {
-            apiKey = withContext(Dispatchers.IO) {
-                loadSavedApiKey(appContext)
-            }
+            apiKey = withContext(Dispatchers.IO) { loadSavedApiKey(context) }
         } catch (_: Exception) {
             apiKey = ""
         } finally {
             apiKeyLoaded = true
-
-            if (apiKey.isNotBlank()) {
-                status =
-                    "کلید ذخیره‌شده بارگذاری شد. تایم‌فریم را انتخاب کن یا دریافت را بزن."
-            }
+            if (apiKey.isNotBlank()) status = "کلید ذخیره‌شده بارگذاری شد. آماده بررسی H1، M15 و M5 هستیم."
         }
     }
 
-    fun requestCandles(interval: String) {
-        selectedInterval = interval
-
+    fun runStrategyCheck() {
         if (!apiKeyLoaded) {
             status = "در حال بارگذاری کلید ذخیره‌شده؛ کمی صبر کن."
-            lastRequestSucceeded = false
             return
         }
-
         if (apiKey.isBlank()) {
-            candles = emptyList()
-            chartInterval = null
-            status =
-                "ابتدا API Key را وارد کن؛ پس از دریافت موفق، روی گوشی ذخیره می‌شود."
-            lastRequestSucceeded = false
+            status = "ابتدا API Key از Twelve Data را وارد کن."
+            lastSuccess = false
             return
         }
-
         if (isLoading) return
 
-        // Remove the previous chart immediately when changing timeframes.
-        candles = emptyList()
-        chartInterval = null
         isLoading = true
-
-        status =
-            "در حال دریافت داده‌های $interval؛ تعداد کندل‌ها افزایش یافته است..."
-
-        lastRequestSucceeded = false
-
-        val keyForRequest = apiKey.trim()
+        analysis = null
+        lastSuccess = false
+        status = "در حال دریافت H1، M15 و M5 و بررسی منطق Williams / EMA / MSB..."
+        val key = apiKey.trim()
 
         scope.launch {
             try {
-                val fetchResult = withContext(Dispatchers.IO) {
-                    fetchCandles(keyForRequest, interval)
+                val result = withContext(Dispatchers.IO) {
+                    val h1 = fetchCandles(key, "1h", 300)
+                    val m15 = fetchCandles(key, "15min", 1000)
+                    val m5 = fetchCandles(key, "5min", 3000)
+                    analyzeStrategy(h1.candles, m15.candles, m5.candles)
+                }
+                withContext(Dispatchers.IO) { saveApiKeySecurely(context, key) }
+                analysis = result
+                lastSuccess = true
+
+                val signal = result.latestSignal
+                val isNewSignal = withContext(Dispatchers.IO) {
+                    registerNewSignalIfNeeded(context, signal, result.m15Candles.lastOrNull()?.timeMillis ?: System.currentTimeMillis())
                 }
 
-                // Save the API key only after a successful response.
-                withContext(Dispatchers.IO) {
-                    saveApiKeySecurely(appContext, keyForRequest)
+                if (isNewSignal && signal != null) {
+                    sendSignalNotification(context, signal)
                 }
-
-                candles = fetchResult.candles
-                chartInterval = interval
 
                 status = buildString {
-                    append(
-                        "دریافت موفق بود؛ ${fetchResult.candles.size} کندل معتبر " +
-                            "از ${fetchResult.requestedCount} کندل درخواستی."
-                    )
-
-                    if (fetchResult.removedOutsideForexSession > 0) {
-                        append(
-                            " ${fetchResult.removedOutsideForexSession} کندل آخرهفته/خارج از ساعات معمول بازار حذف شد."
-                        )
+                    append("بررسی کامل شد: H1=${result.h1Candles.size}، M15=${result.m15Candles.size}، M5=${result.m5Candles.size} کندل معتبر. ")
+                    append(result.status)
+                    if (isNewSignal && signal != null) {
+                        append(" آلارم جدید ${directionName(signal.direction)} ثبت شد.")
                     }
-
-                    append(" کلید API روی گوشی ذخیره شد.")
                 }
-
-                lastRequestSucceeded = true
             } catch (e: Exception) {
-                candles = emptyList()
-                chartInterval = null
-
-                status =
-                    "دریافت ناموفق بود: ${e.message ?: "خطای نامشخص"}"
-
-                lastRequestSucceeded = false
+                analysis = null
+                lastSuccess = false
+                status = "بررسی استراتژی ناموفق بود: ${e.message ?: "خطای نامشخص"}"
             } finally {
                 isLoading = false
             }
@@ -236,36 +282,18 @@ private fun TradingAlarmScreen() {
     )
 
     MaterialTheme(colorScheme = scheme) {
-        CompositionLocalProvider(
-            LocalLayoutDirection provides LayoutDirection.Rtl
-        ) {
-            Surface(
-                modifier = Modifier.fillMaxSize(),
-                color = MaterialTheme.colorScheme.background
-            ) {
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                 Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState())
-                        .padding(16.dp),
+                    modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
+                    Text("Trading Alarm", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.primary)
+                    Text("Williams Gate + EMA 6/11 + M15 Rectangle + M5 MSB", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        text = "Trading Alarm",
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-
-                    Text(
-                        text = "چارت آزمایشی فارکس · AUD/USD",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-
-                    Text(
-                        text = "این نسخه دریافت داده و نمایش کندل را آزمایش می‌کند؛ هنوز سیگنال معاملاتی تولید نمی‌کند.",
+                        "اپ در این مرحله هر سه تایم‌فریم را دریافت می‌کند و منطق اسکریپت را بررسی می‌کند. نمودار اصلی M15 است؛ این اپ معامله باز نمی‌کند.",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurface
-                            .copy(alpha = 0.75f)
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
                     )
 
                     OutlinedTextField(
@@ -273,184 +301,69 @@ private fun TradingAlarmScreen() {
                         onValueChange = { apiKey = it },
                         modifier = Modifier.fillMaxWidth(),
                         enabled = apiKeyLoaded && !isLoading,
-                        label = {
-                            Text("کلید API از Twelve Data")
-                        },
-                        placeholder = {
-                            Text("کلید را اینجا وارد کن")
-                        },
+                        label = { Text("کلید API از Twelve Data") },
+                        placeholder = { Text("کلید را اینجا وارد کن") },
                         singleLine = true,
-                        visualTransformation =
-                            PasswordVisualTransformation(),
+                        visualTransformation = PasswordVisualTransformation(),
                         supportingText = {
-                            Text(
-                                if (apiKeyLoaded && apiKey.isNotBlank()) {
-                                    "کلید ذخیره‌شده بارگذاری شده است."
-                                } else {
-                                    "پس از اولین دریافت موفق، کلید رمزگذاری‌شده روی همین گوشی ذخیره می‌شود."
-                                }
-                            )
+                            Text(if (apiKeyLoaded && apiKey.isNotBlank()) "کلید ذخیره‌شده بارگذاری شده است." else "بعد از بررسی موفق، کلید به‌صورت رمزگذاری‌شده روی همین گوشی ذخیره می‌شود.")
                         }
                     )
 
-                    Text(
-                        "تایم‌فریم",
-                        style = MaterialTheme.typography.titleSmall
-                    )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        FilterChip(
-                            selected = selectedInterval == "5min",
-                            onClick = {
-                                requestCandles("5min")
-                            },
-                            enabled = !isLoading,
-                            label = {
-                                Text("M5")
-                            }
-                        )
-
-                        FilterChip(
-                            selected = selectedInterval == "15min",
-                            onClick = {
-                                requestCandles("15min")
-                            },
-                            enabled = !isLoading,
-                            label = {
-                                Text("M15")
-                            }
-                        )
-
-                        FilterChip(
-                            selected = selectedInterval == "1h",
-                            onClick = {
-                                requestCandles("1h")
-                            },
-                            enabled = !isLoading,
-                            label = {
-                                Text("H1")
-                            }
-                        )
-                    }
-
                     Button(
-                        onClick = {
-                            requestCandles(selectedInterval)
-                        },
-                        enabled = !isLoading && apiKeyLoaded,
+                        onClick = { runStrategyCheck() },
+                        enabled = apiKeyLoaded && !isLoading,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         if (isLoading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary
-                            )
-
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
                             Spacer(Modifier.width(10.dp))
-                            Text("در حال دریافت...")
-                        } else {
-                            Text("دریافت / به‌روزرسانی چارت")
-                        }
+                            Text("در حال بررسی سه تایم‌فریم...")
+                        } else Text("بررسی استراتژی و به‌روزرسانی چارت")
                     }
 
                     Text(
-                        text = status,
+                        status,
                         color = when {
-                            isLoading ->
-                                MaterialTheme.colorScheme.secondary
-
-                            lastRequestSucceeded ->
-                                MaterialTheme.colorScheme.tertiary
-
-                            else ->
-                                MaterialTheme.colorScheme.onSurface
-                                    .copy(alpha = 0.85f)
+                            isLoading -> MaterialTheme.colorScheme.secondary
+                            lastSuccess -> MaterialTheme.colorScheme.tertiary
+                            else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
                         },
                         style = MaterialTheme.typography.bodyMedium
                     )
 
-                    Card(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement =
-                                    Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    "AUD/USD",
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-
-                                Text(
-                                    text = when (chartInterval) {
-                                        "5min" -> "M5"
-                                        "15min" -> "M15"
-                                        "1h" -> "H1"
-                                        else -> "بدون داده"
-                                    },
-                                    color =
-                                        MaterialTheme.colorScheme.secondary
-                                )
+                    val data = analysis
+                    if (data != null) {
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("وضعیت استراتژی", style = MaterialTheme.typography.titleMedium)
+                                Text("Williams Gate: ${if (data.gateReady) "فعال" else "غیرفعال"}")
+                                Text("H1 در انتظار: ${directionName(data.pendingDirection)}")
+                                Text("آخرین M5 MSB: ${directionName(data.latestM5Direction)}")
+                                Text("Williams H1 events در داده دریافت‌شده: ${data.h1WilliamsEvents}")
+                                Text("سیگنال آخر: ${data.latestSignal?.let { directionName(it.direction) + " · " + formatUtc(it.activationTime) } ?: "هنوز مستطیل جدیدی در داده‌های فعلی پیدا نشد"}")
                             }
+                        }
 
-                            if (candles.isNotEmpty()) {
-                                val latest = candles.last()
-
-                                Text(
-                                    text =
-                                        "آخرین Close: ${formatPrice(latest.close)}",
-                                    style =
-                                        MaterialTheme.typography.titleLarge,
-                                    color = if (
-                                        latest.close >= latest.open
-                                    ) {
-                                        Color(0xFF80CBC4)
-                                    } else {
-                                        Color(0xFFEF9A9A)
-                                    }
+                        Card(modifier = Modifier.fillMaxWidth()) {
+                            Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                    Text("AUD/USD · M15", style = MaterialTheme.typography.titleMedium)
+                                    Text("${data.m15Candles.size} کندل", color = MaterialTheme.colorScheme.secondary)
+                                }
+                                data.m15Candles.lastOrNull()?.let { last ->
+                                    Text("آخرین Close: ${formatPrice(last.close)}", style = MaterialTheme.typography.titleLarge)
+                                    Text("زمان آخرین کندل UTC: ${last.time}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
+                                }
+                                CandleChart(
+                                    candles = data.m15Candles,
+                                    emaLines = data.emaLines,
+                                    rectangles = data.rectangles,
+                                    msbLines = data.msbLines,
+                                    modifier = Modifier.fillMaxWidth().height(360.dp)
                                 )
-
-                                Text(
-                                    text =
-                                        "زمان آخرین کندل (UTC): ${latest.time}",
-                                    style =
-                                        MaterialTheme.typography.bodySmall,
-                                    color =
-                                        MaterialTheme.colorScheme.onSurface
-                                            .copy(alpha = 0.7f)
-                                )
+                                Text("نمایش ۶۰ کندل M15 اخیر، میانگین‌های متحرک، خطوط MSB و مستطیل‌های فعال/گذشته.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
                             }
-
-                            CandleChart(
-                                candles = candles.takeLast(60),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(310.dp)
-                            )
-
-                            Text(
-                                text = if (candles.isEmpty()) {
-                                    "برای نمایش نمودار، دریافت داده را با تایم‌فریم انتخاب‌شده اجرا کن."
-                                } else {
-                                    "نمایش ${candles.takeLast(60).size} کندل از ${candles.size} کندل معتبر ${chartInterval ?: ""}"
-                                },
-                                style =
-                                    MaterialTheme.typography.bodySmall,
-                                color =
-                                    MaterialTheme.colorScheme.onSurface
-                                        .copy(alpha = 0.65f)
-                            )
                         }
                     }
 
@@ -461,17 +374,521 @@ private fun TradingAlarmScreen() {
     }
 }
 
-private fun requestedOutputSize(interval: String): Int = when (interval) {
-    "5min" -> 1000
-    "15min" -> 500
-    else -> 200
+private fun analyzeStrategy(
+    h1: List<Candle>,
+    m15: List<Candle>,
+    m5: List<Candle>
+): StrategyAnalysis {
+    require(h1.size >= 60) { "داده H1 کافی نیست؛ حداقل ۶۰ کندل لازم است." }
+    require(m15.size >= 30) { "داده M15 کافی نیست؛ حداقل ۳۰ کندل لازم است." }
+    require(m5.size >= 30) { "داده M5 کافی نیست؛ حداقل ۳۰ کندل لازم است." }
+
+    val h1Closes = h1.map { it.close }
+    val h1Ema6 = ema(h1Closes, EMA6_LENGTH)
+    val h1Williams = calculateH1Williams(h1)
+    val m15Closes = m15.map { it.close }
+    val m15Ema6 = ema(m15Closes, EMA6_LENGTH)
+    val m15Ema11 = ema(m15Closes, EMA11_LENGTH)
+    val ema50 = ema(m15Closes, 50)
+    val ema125 = ema(m15Closes, 125)
+    val ema150 = ema(m15Closes, 150)
+    val ema250 = ema(m15Closes, 250)
+    val ema500 = ema(m15Closes, 500)
+    val m5EventsByTime = calculateM5MsbEvents(m5, MSB_ZIGZAG_LENGTH, MSB_FIB_FACTOR)
+
+    val rectangles = mutableListOf<StrategyRectangle>()
+    val drawnMsbLines = mutableListOf<M5MsbEvent>()
+    val bullBreak = BooleanArray(m15.size)
+    val bearBreak = BooleanArray(m15.size)
+    val ema6Workflow = BooleanArray(m15.size)
+
+    var williamsGateReady = false
+    var pendingH1Direction = 0
+    var williamsGateStartIndex: Int? = null
+    var lastWilliamsH1BarTime: Long? = null
+    var lastM5MSBDirection = 0
+    var h1WilliamsEvents = 0
+    var h1Cursor = -1
+    var previousHourBucket = Long.MIN_VALUE
+    var latestSignal: StrategySignal? = null
+
+    for (i in m15.indices) {
+        val bar = m15[i]
+        while (h1Cursor + 1 < h1.size && h1[h1Cursor + 1].timeMillis + H1_MS <= bar.timeMillis) {
+            h1Cursor++
+        }
+
+        val hourBucket = bar.timeMillis / H1_MS
+        val newH1Period = hourBucket != previousHourBucket
+        previousHourBucket = hourBucket
+
+        var completedH1Index = h1Cursor
+        if (completedH1Index !in h1.indices) completedH1Index = -1
+
+        var justHadWilliamsEvent = false
+        if (newH1Period && completedH1Index >= 0) {
+            val wi = h1Williams[completedH1Index]
+            justHadWilliamsEvent = wi.greenStart || wi.redStart
+            if (justHadWilliamsEvent) h1WilliamsEvents++
+
+            if (pendingH1Direction == 0) {
+                if (wi.active) {
+                    if (!williamsGateReady) {
+                        williamsGateStartIndex = i
+                        lastM5MSBDirection = 0
+                    }
+                    williamsGateReady = true
+                    lastWilliamsH1BarTime = h1[completedH1Index].timeMillis
+                } else if (williamsGateReady && lastWilliamsH1BarTime != null) {
+                    val elapsed = h1[completedH1Index].timeMillis - lastWilliamsH1BarTime!!
+                    if (elapsed > H1_MS) {
+                        williamsGateReady = false
+                        williamsGateStartIndex = null
+                        lastWilliamsH1BarTime = null
+                        lastM5MSBDirection = 0
+                    }
+                }
+            }
+        }
+
+        // In the Pine script, workflow activity is evaluated before the H1 break
+        // is consumed on this M15 bar. Preserve that ordering.
+        val workflowActiveThisBar = williamsGateReady || pendingH1Direction != 0
+        ema6Workflow[i] = workflowActiveThisBar
+
+        var h1BuySetupEvent = false
+        var h1SellSetupEvent = false
+        if (newH1Period && completedH1Index >= 1 && williamsGateReady && pendingH1Direction == 0) {
+            val k = completedH1Index
+            val previousEma = h1Ema6[k - 1]
+            val currentEma = h1Ema6[k]
+            val hb = h1[k]
+            h1BuySetupEvent = hb.open < previousEma && hb.close > currentEma && hb.close > hb.open
+            h1SellSetupEvent = hb.open > previousEma && hb.close < currentEma && hb.close < hb.open
+            when {
+                h1BuySetupEvent -> {
+                    pendingH1Direction = 1
+                    williamsGateReady = false
+                }
+                h1SellSetupEvent -> {
+                    pendingH1Direction = -1
+                    williamsGateReady = false
+                }
+            }
+        }
+
+        // Confirmed M15 body must cross both EMA 6 and EMA 11 in the same direction.
+        if (workflowActiveThisBar && i >= 1) {
+            val current = m15[i]
+            bullBreak[i] = current.open < m15Ema6[i - 1] &&
+                current.close > m15Ema6[i] &&
+                current.open < m15Ema11[i - 1] &&
+                current.close > m15Ema11[i] &&
+                current.close > current.open
+
+            bearBreak[i] = current.open > m15Ema6[i - 1] &&
+                current.close < m15Ema6[i] &&
+                current.open > m15Ema11[i - 1] &&
+                current.close < m15Ema11[i] &&
+                current.close < current.open
+        }
+
+        if (workflowActiveThisBar) {
+            val m15Start = bar.timeMillis
+            val m15End = m15Start + M15_MS
+            m5EventsByTime.forEach { (eventTime, events) ->
+                if (eventTime >= m15Start && eventTime < m15End) {
+                    for (event in events) {
+                        lastM5MSBDirection = event.direction
+                        drawnMsbLines.add(event)
+                    }
+                }
+            }
+        }
+
+        val directionsMatch = pendingH1Direction != 0 &&
+            lastM5MSBDirection != 0 &&
+            pendingH1Direction == lastM5MSBDirection
+
+        if (directionsMatch) {
+            val direction = pendingH1Direction
+            val gateIndex = williamsGateStartIndex ?: i
+            val searchLimit = min(M15_SEARCH_BACK_BARS, max(i - gateIndex, 0))
+            var foundIndex: Int? = null
+            var offset = 0
+            while (offset <= searchLimit && foundIndex == null) {
+                val candidate = i - offset
+                if (candidate >= 0) {
+                    val matches = if (direction == 1) bullBreak[candidate] else bearBreak[candidate]
+                    if (matches) foundIndex = candidate
+                }
+                offset++
+            }
+
+            if (foundIndex != null) {
+                val leftIndex = foundIndex
+                val trigger = m15[leftIndex]
+                val outsideAtActivation = bar.open > trigger.high || bar.open < trigger.low
+                val rectangle = StrategyRectangle(
+                    direction = direction,
+                    leftIndex = leftIndex,
+                    activationIndex = i,
+                    rightIndex = i,
+                    top = trigger.high,
+                    bottom = trigger.low,
+                    activationTime = bar.timeMillis,
+                    armed = outsideAtActivation,
+                    touched = false
+                )
+                rectangles.add(rectangle)
+                latestSignal = StrategySignal(
+                    direction = direction,
+                    activationTime = bar.timeMillis,
+                    leftTime = trigger.timeMillis,
+                    top = trigger.high,
+                    bottom = trigger.low
+                )
+                while (rectangles.size > PAST_SIGNALS_TO_SHOW) rectangles.removeAt(0)
+
+                // One rectangle consumes this Williams-gated setup cycle.
+                pendingH1Direction = 0
+                williamsGateReady = false
+                williamsGateStartIndex = null
+                lastWilliamsH1BarTime = null
+            }
+        }
+
+        // Pine section 12: extend each rectangle until its first retest after arming.
+        for (rectangle in rectangles) {
+            if (rectangle.touched) continue
+            val overlaps = bar.high >= rectangle.bottom && bar.low <= rectangle.top
+            if (i == rectangle.activationIndex) {
+                if (rectangle.armed && overlaps) {
+                    rectangle.rightIndex = i
+                    rectangle.touched = true
+                } else if (!rectangle.armed && (bar.close > rectangle.top || bar.close < rectangle.bottom)) {
+                    rectangle.armed = true
+                }
+            } else if (i > rectangle.activationIndex) {
+                rectangle.rightIndex = i
+                if (!rectangle.armed) {
+                    if (bar.close > rectangle.top || bar.close < rectangle.bottom) rectangle.armed = true
+                } else if (overlaps) {
+                    rectangle.touched = true
+                }
+            }
+        }
+    }
+
+    val emaLines = listOf(
+        ChartLine("EMA 50", 0xFF2962FF, ema50.map { it as Double? }, 1.35f),
+        ChartLine("EMA 125", 0xFFFF9800, ema125.map { it as Double? }, 1.35f),
+        ChartLine("EMA 150", 0xFF00BCD4, ema150.map { it as Double? }, 1.35f),
+        ChartLine("EMA 250", 0xFFE91E63, ema250.map { it as Double? }, 1.35f),
+        ChartLine("EMA 500", 0xFF9C27B0, ema500.map { it as Double? }, 1.35f),
+        ChartLine("M15 EMA 6", 0xFFFF9800, m15Ema6.mapIndexed { index, value -> if (ema6Workflow[index]) value else null }, 2.0f)
+    )
+
+    val lastWilliamsTime = lastWilliamsH1BarTime
+    val stateText = buildString {
+        append("Williams Gate ")
+        append(if (williamsGateReady) "فعال" else "غیرفعال")
+        append("؛ H1 در انتظار: ${directionName(pendingH1Direction)}")
+        append("؛ آخرین M5 MSB: ${directionName(lastM5MSBDirection)}")
+        if (lastWilliamsTime != null) append("؛ آخرین H1 Williams: ${formatUtc(lastWilliamsTime)}")
+        if (justNoRectangleHint(rectangles, latestSignal)) append("؛ هنوز مستطیل معتبر تازه‌ای در بازه دریافت‌شده ساخته نشده است")
+    }
+
+    return StrategyAnalysis(
+        h1Candles = h1,
+        m15Candles = m15,
+        m5Candles = m5,
+        rectangles = rectangles.toList(),
+        msbLines = drawnMsbLines.takeLast(120),
+        emaLines = emaLines,
+        latestSignal = latestSignal,
+        gateReady = williamsGateReady,
+        pendingDirection = pendingH1Direction,
+        latestM5Direction = lastM5MSBDirection,
+        h1WilliamsEvents = h1WilliamsEvents,
+        status = stateText
+    )
 }
+
+private fun justNoRectangleHint(
+    rectangles: List<StrategyRectangle>,
+    latestSignal: StrategySignal?
+): Boolean = rectangles.isEmpty() && latestSignal == null
+
+private fun calculateH1Williams(candles: List<Candle>): List<H1WilliamsState> {
+    val n = candles.size
+    val bottom = DoubleArray(n) { Double.NaN }
+    val top = DoubleArray(n) { Double.NaN }
+
+    for (i in candles.indices) {
+        val highClose = rollingExtreme(candles.map { it.close }, i, WVF_PD, true)
+        val lowClose = rollingExtreme(candles.map { it.close }, i, WVF_PD, false)
+        if (highClose != null && highClose != 0.0) bottom[i] = ((highClose - candles[i].low) / highClose) * 100.0
+        if (lowClose != null && lowClose != 0.0) top[i] = ((lowClose - candles[i].high) / lowClose) * 100.0
+    }
+
+    val bottomActive = BooleanArray(n)
+    val topActive = BooleanArray(n)
+    for (i in 0 until n) {
+        val bMean = rollingSma(bottom, i, WVF_BBL)
+        val bStd = rollingStdev(bottom, i, WVF_BBL)
+        val bRange = rollingArrayExtreme(bottom, i, WVF_LOOKBACK, true)
+        val bUpper = if (bMean != null && bStd != null) bMean + WVF_MULT * bStd else null
+        val b = (bUpper != null && bottom[i].isFinite() && bottom[i] >= bUpper) ||
+            (bRange != null && bottom[i].isFinite() && bottom[i] >= bRange * WVF_PERCENTILE)
+
+        val tMean = rollingSma(top, i, WVF_BBL)
+        val tStd = rollingStdev(top, i, WVF_BBL)
+        val tRange = rollingArrayExtreme(top, i, WVF_LOOKBACK, false)
+        val tLower = if (tMean != null && tStd != null) tMean - WVF_MULT * tStd else null
+        val t = (tLower != null && top[i].isFinite() && top[i] <= tLower) ||
+            (tRange != null && top[i].isFinite() && top[i] <= tRange * WVF_PERCENTILE)
+
+        bottomActive[i] = b
+        topActive[i] = t
+    }
+
+    return candles.indices.map { i ->
+        val greenStart = bottomActive[i] && (i == 0 || !bottomActive[i - 1])
+        val redStart = topActive[i] && (i == 0 || !topActive[i - 1])
+        H1WilliamsState(
+            active = bottomActive[i] || topActive[i],
+            greenStart = greenStart,
+            redStart = redStart
+        )
+    }
+}
+
+private fun calculateM5MsbEvents(
+    candles: List<Candle>,
+    zigzagLength: Int,
+    fibFactor: Double
+): Map<Long, List<M5MsbEvent>> {
+    if (candles.isEmpty()) return emptyMap()
+    val n = candles.size
+    val highs = candles.map { it.high }
+    val lows = candles.map { it.low }
+    val toUp = BooleanArray(n)
+    val toDown = BooleanArray(n)
+    val trend = IntArray(n) { 1 }
+    val lowVal = DoubleArray(n) { Double.NaN }
+    val highVal = DoubleArray(n) { Double.NaN }
+    val lowIsRollingExtreme = BooleanArray(n)
+    val highIsRollingExtreme = BooleanArray(n)
+    val lastLowSource = IntArray(n) { -1 }
+    val lastHighSource = IntArray(n) { -1 }
+
+    for (i in 0 until n) {
+        val from = max(0, i - zigzagLength + 1)
+        var maxHigh = Double.NEGATIVE_INFINITY
+        var minLow = Double.POSITIVE_INFINITY
+        for (j in from..i) {
+            maxHigh = max(maxHigh, highs[j])
+            minLow = min(minLow, lows[j])
+        }
+        toUp[i] = highs[i] >= maxHigh
+        toDown[i] = lows[i] <= minLow
+        val previousTrend = if (i == 0) 1 else trend[i - 1]
+        trend[i] = when {
+            previousTrend == 1 && toDown[i] -> -1
+            previousTrend == -1 && toUp[i] -> 1
+            else -> previousTrend
+        }
+
+        // Pine ta.barssince(to_up[1]): number of bars since a to_up event
+        // on the previous/currently shifted series, so current M5 is excluded.
+        var lastUpBeforeCurrent = -1
+        var lastDownBeforeCurrent = -1
+        for (j in i - 1 downTo 0) {
+            if (lastUpBeforeCurrent < 0 && toUp[j]) lastUpBeforeCurrent = j
+            if (lastDownBeforeCurrent < 0 && toDown[j]) lastDownBeforeCurrent = j
+            if (lastUpBeforeCurrent >= 0 && lastDownBeforeCurrent >= 0) break
+        }
+        val upSince = if (lastUpBeforeCurrent >= 0) (i - 1) - lastUpBeforeCurrent else 0
+        val downSince = if (lastDownBeforeCurrent >= 0) (i - 1) - lastDownBeforeCurrent else 0
+        val lowLength = if (upSince > 0) upSince else 1
+        val highLength = if (downSince > 0) downSince else 1
+        val lowFrom = max(0, i - lowLength + 1)
+        val highFrom = max(0, i - highLength + 1)
+        var localLow = Double.POSITIVE_INFINITY
+        var localHigh = Double.NEGATIVE_INFINITY
+        for (j in lowFrom..i) localLow = min(localLow, lows[j])
+        for (j in highFrom..i) localHigh = max(localHigh, highs[j])
+        lowVal[i] = localLow
+        highVal[i] = localHigh
+        lowIsRollingExtreme[i] = abs(localLow - lows[i]) < 1e-12
+        highIsRollingExtreme[i] = abs(localHigh - highs[i]) < 1e-12
+        lastLowSource[i] = if (lowIsRollingExtreme[i]) i else if (i > 0) lastLowSource[i - 1] else -1
+        lastHighSource[i] = if (highIsRollingExtreme[i]) i else if (i > 0) lastHighSource[i - 1] else -1
+    }
+
+    val highPivotValues = mutableListOf<Double>()
+    val highPivotTimes = mutableListOf<Long>()
+    val lowPivotValues = mutableListOf<Double>()
+    val lowPivotTimes = mutableListOf<Long>()
+    val output = linkedMapOf<Long, MutableList<M5MsbEvent>>()
+    var market = 1
+    var lastLowAtMarketChange: Double? = null
+    var lastHighAtMarketChange: Double? = null
+
+    for (i in 0 until n) {
+        val changedTrend = i > 0 && trend[i] != trend[i - 1]
+        val lowSource = lastLowSource[i]
+        val highSource = lastHighSource[i]
+        val lowTime = if (lowSource >= 0) candles[lowSource].timeMillis else null
+        val highTime = if (highSource >= 0) candles[highSource].timeMillis else null
+
+        if (changedTrend) {
+            if (trend[i] == 1 && lowTime != null && lowVal[i].isFinite()) {
+                lowPivotValues.add(lowVal[i])
+                lowPivotTimes.add(lowTime)
+            }
+            if (trend[i] == -1 && highTime != null && highVal[i].isFinite()) {
+                highPivotValues.add(highVal[i])
+                highPivotTimes.add(highTime)
+            }
+        }
+
+        val hCount = highPivotValues.size
+        val lCount = lowPivotValues.size
+        val h0 = if (hCount >= 1) highPivotValues[hCount - 1] else null
+        val h1 = if (hCount >= 2) highPivotValues[hCount - 2] else null
+        val h0t = if (hCount >= 1) highPivotTimes[hCount - 1] else null
+        val h1t = if (hCount >= 2) highPivotTimes[hCount - 2] else null
+        val l0 = if (lCount >= 1) lowPivotValues[lCount - 1] else null
+        val l1 = if (lCount >= 2) lowPivotValues[lCount - 2] else null
+        val l0t = if (lCount >= 1) lowPivotTimes[lCount - 1] else null
+        val l1t = if (lCount >= 2) lowPivotTimes[lCount - 2] else null
+
+        val priorMarket = market
+        val duplicateCurrentStructure = samePrice(lastLowAtMarketChange, l0) ||
+            samePrice(lastHighAtMarketChange, h0)
+        var nextMarket = priorMarket
+
+        if (!duplicateCurrentStructure) {
+            if (priorMarket == 1 && l0 != null && l1 != null && h0 != null &&
+                l0 < l1 && l0 < l1 - abs(h0 - l1) * fibFactor
+            ) {
+                nextMarket = -1
+            } else if (priorMarket == -1 && h0 != null && h1 != null && l0 != null &&
+                h0 > h1 && h0 > h1 + abs(h1 - l0) * fibFactor
+            ) {
+                nextMarket = 1
+            }
+        }
+
+        val changedMarket = nextMarket != priorMarket
+        if (changedMarket) {
+            if (nextMarket == 1 && h1 != null && h1t != null && h0t != null && l0t != null) {
+                output.getOrPut(candles[i].timeMillis) { mutableListOf() }.add(
+                    M5MsbEvent(
+                        direction = 1,
+                        level = h1,
+                        startTime = h1t,
+                        endTime = h0t,
+                        labelTime = (h1t + l0t) / 2L,
+                        eventTime = candles[i].timeMillis
+                    )
+                )
+            } else if (nextMarket == -1 && l1 != null && l1t != null && l0t != null && h0t != null) {
+                output.getOrPut(candles[i].timeMillis) { mutableListOf() }.add(
+                    M5MsbEvent(
+                        direction = -1,
+                        level = l1,
+                        startTime = l1t,
+                        endTime = l0t,
+                        labelTime = (l1t + h0t) / 2L,
+                        eventTime = candles[i].timeMillis
+                    )
+                )
+            }
+            // ta.valuewhen(change(market), l0/h0, 0) becomes this bar's pivot
+            // reference on the following bars.
+            lastLowAtMarketChange = l0
+            lastHighAtMarketChange = h0
+        }
+        market = nextMarket
+    }
+
+    return output
+}
+
+private fun ema(values: List<Double>, length: Int): List<Double> {
+    if (values.isEmpty()) return emptyList()
+    val alpha = 2.0 / (length + 1.0)
+    val result = ArrayList<Double>(values.size)
+    var current = values[0]
+    result.add(current)
+    for (i in 1 until values.size) {
+        current = alpha * values[i] + (1.0 - alpha) * current
+        result.add(current)
+    }
+    return result
+}
+
+private fun rollingExtreme(values: List<Double>, index: Int, length: Int, highest: Boolean): Double? {
+    if (index < 0 || values.isEmpty()) return null
+    val start = max(0, index - length + 1)
+    var result = if (highest) Double.NEGATIVE_INFINITY else Double.POSITIVE_INFINITY
+    for (i in start..index) result = if (highest) max(result, values[i]) else min(result, values[i])
+    return result
+}
+
+private fun rollingArrayExtreme(values: DoubleArray, index: Int, length: Int, highest: Boolean): Double? {
+    if (index < 0 || values.isEmpty()) return null
+    val start = max(0, index - length + 1)
+    var result = if (highest) Double.NEGATIVE_INFINITY else Double.POSITIVE_INFINITY
+    var found = false
+    for (i in start..index) {
+        val v = values[i]
+        if (!v.isFinite()) continue
+        result = if (highest) max(result, v) else min(result, v)
+        found = true
+    }
+    return if (found) result else null
+}
+
+private fun rollingSma(values: DoubleArray, index: Int, length: Int): Double? {
+    if (index < length - 1) return null
+    var total = 0.0
+    for (i in index - length + 1..index) {
+        if (!values[i].isFinite()) return null
+        total += values[i]
+    }
+    return total / length
+}
+
+private fun rollingStdev(values: DoubleArray, index: Int, length: Int): Double? {
+    if (index < length - 1) return null
+    val mean = rollingSma(values, index, length) ?: return null
+    var sum = 0.0
+    for (i in index - length + 1..index) {
+        if (!values[i].isFinite()) return null
+        val d = values[i] - mean
+        sum += d * d
+    }
+    // Pine ta.stdev uses population deviation by default (biased = true).
+    return sqrt(sum / length)
+}
+
+private fun samePrice(a: Double?, b: Double?): Boolean =
+    a != null && b != null && a.isFinite() && b.isFinite() && a == b
 
 private fun fetchCandles(
     apiKey: String,
-    interval: String
+    interval: String,
+    requestedCount: Int
 ): CandleFetchResult {
-    val requestedCount = requestedOutputSize(interval)
+    val intervalMs = when (interval) {
+        "5min" -> M5_MS
+        "15min" -> M15_MS
+        else -> H1_MS
+    }
 
     val query = listOf(
         "symbol" to "AUD/USD",
@@ -481,119 +898,54 @@ private fun fetchCandles(
         "format" to "JSON",
         "order" to "ASC",
         "apikey" to apiKey
-    ).joinToString("&") { (name, value) ->
-        "${urlEncode(name)}=${urlEncode(value)}"
-    }
+    ).joinToString("&") { (name, value) -> "${urlEncode(name)}=${urlEncode(value)}" }
 
-    val connection = (
-        URL(
-            "https://api.twelvedata.com/time_series?$query"
-        ).openConnection() as HttpURLConnection
-    ).apply {
+    val connection = (URL("https://api.twelvedata.com/time_series?$query").openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
         connectTimeout = 15_000
-        readTimeout = 20_000
+        readTimeout = 25_000
         setRequestProperty("Accept", "application/json")
     }
 
     try {
         val responseCode = connection.responseCode
-
-        val stream = if (responseCode in 200..299) {
-            connection.inputStream
-        } else {
-            connection.errorStream
-        }
-
-        val body = stream
-            ?.bufferedReader(Charsets.UTF_8)
-            ?.use { it.readText() }
-            .orEmpty()
-
-        if (body.isBlank()) {
-            throw IOException(
-                "پاسخ خالی از سرور دریافت شد (HTTP $responseCode)."
-            )
-        }
+        val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
+        val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+        if (body.isBlank()) throw IOException("پاسخ خالی از سرور دریافت شد (HTTP $responseCode).")
 
         val json = JSONObject(body)
         val values = json.optJSONArray("values")
-
-        if (
-            responseCode !in 200..299 ||
-            values == null ||
-            json.optString("status") == "error"
-        ) {
-            val message = json.optString("message")
-                .ifBlank {
-                    json.optString("msg")
-                }
-                .ifBlank {
-                    "خطای HTTP $responseCode یا پاسخ نامعتبر API"
-                }
-
-            throw IOException(message)
+        if (responseCode !in 200..299 || values == null || json.optString("status") == "error") {
+            val message = json.optString("message").ifBlank { json.optString("msg") }.ifBlank { "خطای HTTP $responseCode یا پاسخ نامعتبر API" }
+            throw IOException("$interval: $message")
         }
 
-        val result = mutableListOf<Candle>()
-
+        val raw = mutableListOf<Candle>()
         for (index in 0 until values.length()) {
             val item = values.optJSONObject(index) ?: continue
-
             val time = item.optString("datetime")
-            val open =
-                item.optString("open").toDoubleOrNull() ?: continue
-            val high =
-                item.optString("high").toDoubleOrNull() ?: continue
-            val low =
-                item.optString("low").toDoubleOrNull() ?: continue
-            val close =
-                item.optString("close").toDoubleOrNull() ?: continue
-
-            if (time.isNotBlank()) {
-                result.add(
-                    Candle(
-                        time = time,
-                        open = open,
-                        high = high,
-                        low = low,
-                        close = close
-                    )
-                )
-            }
+            val timeMillis = parseUtcMillis(time) ?: continue
+            val open = item.optString("open").toDoubleOrNull() ?: continue
+            val high = item.optString("high").toDoubleOrNull() ?: continue
+            val low = item.optString("low").toDoubleOrNull() ?: continue
+            val close = item.optString("close").toDoubleOrNull() ?: continue
+            if (time.isNotBlank() && high >= low) raw.add(Candle(time, timeMillis, open, high, low, close))
         }
 
-        val sorted = result
-            .sortedBy { it.time }
-            .takeLast(requestedCount)
-
-        if (sorted.isEmpty()) {
-            throw IOException(
-                "API هیچ کندل معتبری برنگرداند؛ نماد، تایم‌فریم یا API Key را بررسی کن."
-            )
-        }
-
-        val marketCandles = sorted.filter {
-            isWithinUsualForexSession(it.time)
-        }
-
-        val removedCount = sorted.size - marketCandles.size
-
-        if (marketCandles.isEmpty()) {
-            val sampleTimes = sorted
-                .takeLast(3)
-                .joinToString(", ") { it.time }
-
-            throw IOException(
-                "در $requestedCount کندل دریافتی هیچ کندلی در ساعات معمول بازار پیدا نشد. " +
-                    "آخرین زمان‌های API: $sampleTimes. " +
-                    "این پاسخ را باید بررسی کنیم؛ چارت قبلی پاک شد تا با تایم‌فریم جدید اشتباه نشود."
-            )
+        val unique = raw.distinctBy { it.timeMillis }.sortedBy { it.timeMillis }
+        val now = System.currentTimeMillis()
+        val closed = unique.filter { it.timeMillis + intervalMs <= now }
+        val inSession = closed.filter { isWithinUsualForexSession(it.timeMillis) }
+        if (inSession.isEmpty()) {
+            val sample = unique.takeLast(3).joinToString(", ") { it.time }
+            throw IOException("$interval: کندل معتبر در ساعات معمول بازار پیدا نشد. آخرین زمان‌های پاسخ API: $sample")
         }
 
         return CandleFetchResult(
-            candles = marketCandles,
-            removedOutsideForexSession = removedCount,
+            candles = inSession,
+            rawCount = unique.size,
+            removedOutsideForexSession = closed.size - inSession.size,
+            removedUnclosed = unique.size - closed.size,
             requestedCount = requestedCount
         )
     } finally {
@@ -601,382 +953,333 @@ private fun fetchCandles(
     }
 }
 
-private fun loadSavedApiKey(context: Context): String {
-    val encrypted = context
-        .getSharedPreferences(
-            PREFS_NAME,
-            Context.MODE_PRIVATE
-        )
-        .getString(API_KEY_PREF, null) ?: return ""
+private fun parseUtcMillis(value: String): Long? {
+    val formats = listOf("yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm")
+    for (pattern in formats) {
+        try {
+            val fmt = SimpleDateFormat(pattern, Locale.US).apply {
+                isLenient = false
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
+            val parsed = fmt.parse(value)
+            if (parsed != null) return parsed.time
+        } catch (_: Exception) { }
+    }
+    return null
+}
 
+private fun isWithinUsualForexSession(timeMillis: Long): Boolean {
+    val newYork = Calendar.getInstance(TimeZone.getTimeZone("America/New_York"), Locale.US).apply {
+        timeInMillis = timeMillis
+    }
+    val day = newYork.get(Calendar.DAY_OF_WEEK)
+    val minuteOfDay = newYork.get(Calendar.HOUR_OF_DAY) * 60 + newYork.get(Calendar.MINUTE)
+    val sessionBoundary = 17 * 60
+    return when (day) {
+        Calendar.SATURDAY -> false
+        Calendar.SUNDAY -> minuteOfDay >= sessionBoundary
+        Calendar.FRIDAY -> minuteOfDay < sessionBoundary
+        else -> true
+    }
+}
+
+private fun loadSavedApiKey(context: Context): String {
+    val encrypted = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(API_KEY_PREF, null) ?: return ""
     return try {
         decryptApiKey(encrypted)
     } catch (_: Exception) {
-        context
-            .getSharedPreferences(
-                PREFS_NAME,
-                Context.MODE_PRIVATE
-            )
-            .edit()
-            .remove(API_KEY_PREF)
-            .apply()
-
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().remove(API_KEY_PREF).apply()
         ""
     }
 }
 
-private fun saveApiKeySecurely(
-    context: Context,
-    apiKey: String
-) {
+private fun saveApiKeySecurely(context: Context, apiKey: String) {
     if (apiKey.isBlank()) return
-
     val encrypted = encryptApiKey(apiKey)
-
-    context
-        .getSharedPreferences(
-            PREFS_NAME,
-            Context.MODE_PRIVATE
-        )
-        .edit()
-        .putString(API_KEY_PREF, encrypted)
-        .apply()
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putString(API_KEY_PREF, encrypted).apply()
 }
 
 private fun getOrCreateApiKeySecret(): SecretKey {
     val keyStore = KeyStore.getInstance("AndroidKeyStore")
     keyStore.load(null)
-
-    val existing = keyStore.getKey(
-        KEY_ALIAS,
-        null
-    ) as? SecretKey
-
+    val existing = keyStore.getKey(KEY_ALIAS, null) as? SecretKey
     if (existing != null) return existing
 
-    val generator = KeyGenerator.getInstance(
-        KeyProperties.KEY_ALGORITHM_AES,
-        "AndroidKeyStore"
-    )
-
+    val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
     val spec = KeyGenParameterSpec.Builder(
         KEY_ALIAS,
-        KeyProperties.PURPOSE_ENCRYPT or
-            KeyProperties.PURPOSE_DECRYPT
+        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
     )
         .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-        .setEncryptionPaddings(
-            KeyProperties.ENCRYPTION_PADDING_NONE
-        )
+        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
         .setRandomizedEncryptionRequired(true)
         .build()
-
     generator.init(spec)
     return generator.generateKey()
 }
 
 private fun encryptApiKey(apiKey: String): String {
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-
-    cipher.init(
-        Cipher.ENCRYPT_MODE,
-        getOrCreateApiKeySecret()
-    )
-
+    cipher.init(Cipher.ENCRYPT_MODE, getOrCreateApiKeySecret())
     val iv = cipher.iv
-
-    val encrypted = cipher.doFinal(
-        apiKey.toByteArray(StandardCharsets.UTF_8)
-    )
-
-    val buffer = ByteBuffer.allocate(
-        4 + iv.size + encrypted.size
-    )
-
+    val encrypted = cipher.doFinal(apiKey.toByteArray(StandardCharsets.UTF_8))
+    val buffer = ByteBuffer.allocate(4 + iv.size + encrypted.size)
     buffer.putInt(iv.size)
     buffer.put(iv)
     buffer.put(encrypted)
-
-    return Base64.encodeToString(
-        buffer.array(),
-        Base64.NO_WRAP
-    )
+    return Base64.encodeToString(buffer.array(), Base64.NO_WRAP)
 }
 
 private fun decryptApiKey(encoded: String): String {
-    val allBytes = Base64.decode(
-        encoded,
-        Base64.NO_WRAP
-    )
-
-    val buffer = ByteBuffer.wrap(allBytes)
-
-    if (buffer.remaining() < 5) {
-        throw IOException("کلید ذخیره‌شده معتبر نیست.")
-    }
-
+    val bytes = Base64.decode(encoded, Base64.NO_WRAP)
+    val buffer = ByteBuffer.wrap(bytes)
+    if (buffer.remaining() < 5) throw IOException("کلید ذخیره‌شده معتبر نیست.")
     val ivLength = buffer.int
-
-    if (
-        ivLength <= 0 ||
-        ivLength > buffer.remaining()
-    ) {
-        throw IOException("داده رمزگذاری‌شده نامعتبر است.")
-    }
-
+    if (ivLength <= 0 || ivLength > buffer.remaining()) throw IOException("داده رمزگذاری‌شده نامعتبر است.")
     val iv = ByteArray(ivLength)
     buffer.get(iv)
-
     val ciphertext = ByteArray(buffer.remaining())
     buffer.get(ciphertext)
-
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-
-    cipher.init(
-        Cipher.DECRYPT_MODE,
-        getOrCreateApiKeySecret(),
-        GCMParameterSpec(128, iv)
-    )
-
-    return String(
-        cipher.doFinal(ciphertext),
-        StandardCharsets.UTF_8
-    )
+    cipher.init(Cipher.DECRYPT_MODE, getOrCreateApiKeySecret(), GCMParameterSpec(128, iv))
+    return String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8)
 }
 
-private fun isWithinUsualForexSession(
-    utcDateTime: String
-): Boolean {
-    return try {
-        val parser = SimpleDateFormat(
-            "yyyy-MM-dd HH:mm:ss",
-            Locale.US
-        ).apply {
-            isLenient = false
-            timeZone = TimeZone.getTimeZone("UTC")
-        }
-
-        val parsed: Date =
-            parser.parse(utcDateTime) ?: return false
-
-        val newYork = Calendar.getInstance(
-            TimeZone.getTimeZone("America/New_York"),
-            Locale.US
-        ).apply {
-            time = parsed
-        }
-
-        val day = newYork.get(Calendar.DAY_OF_WEEK)
-
-        val minuteOfDay =
-            newYork.get(Calendar.HOUR_OF_DAY) * 60 +
-                newYork.get(Calendar.MINUTE)
-
-        val closeOrOpenMinute = 17 * 60
-
-        when (day) {
-            Calendar.SATURDAY -> false
-            Calendar.SUNDAY ->
-                minuteOfDay >= closeOrOpenMinute
-
-            Calendar.FRIDAY ->
-                minuteOfDay < closeOrOpenMinute
-
-            else -> true
-        }
-    } catch (_: Exception) {
-        false
+private fun createNotificationChannel(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            "Trading Alarm signals",
+            NotificationManager.IMPORTANCE_DEFAULT
+        ).apply { description = "BUY/SELL rectangle signals from the configured strategy" }
+        manager.createNotificationChannel(channel)
     }
 }
 
-private fun urlEncode(value: String): String =
-    URLEncoder.encode(value, "UTF-8")
+private fun registerNewSignalIfNeeded(
+    context: Context,
+    signal: StrategySignal?,
+    latestClosedM15Time: Long
+): Boolean {
+    val prefs = context.getSharedPreferences(SIGNAL_PREFS, Context.MODE_PRIVATE)
+    val baselineSet = prefs.getBoolean(SIGNAL_BASELINE_SET_KEY, false)
+    val previousTime = prefs.getLong(LAST_SIGNAL_TIME_KEY, Long.MIN_VALUE)
+    if (!baselineSet) {
+        // Baseline uses the latest closed M15 candle time, not wall-clock time,
+        // so a new signal on the immediately following M15 bar is not skipped.
+        prefs.edit()
+            .putBoolean(SIGNAL_BASELINE_SET_KEY, true)
+            .putLong(LAST_SIGNAL_TIME_KEY, signal?.activationTime ?: latestClosedM15Time)
+            .apply()
+        return false
+    }
+    if (signal != null && signal.activationTime > previousTime) {
+        prefs.edit().putLong(LAST_SIGNAL_TIME_KEY, signal.activationTime).apply()
+        return true
+    }
+    return false
+}
 
-private fun formatPrice(value: Double): String =
-    String.format(Locale.US, "%.5f", value)
+private fun sendSignalNotification(context: Context, signal: StrategySignal) {
+    if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Notification.Builder(context, NOTIFICATION_CHANNEL_ID)
+    } else {
+        @Suppress("DEPRECATION")
+        Notification.Builder(context)
+    }
+    val text = "${directionName(signal.direction)} · AUD/USD · مستطیل M15"
+    val notification = builder
+        .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setContentTitle("Trading Alarm")
+        .setContentText(text)
+        .setStyle(Notification.BigTextStyle().bigText("${text}\nزمان: ${formatUtc(signal.activationTime)}\nقیمت بالا: ${formatPrice(signal.top)} · قیمت پایین: ${formatPrice(signal.bottom)}"))
+        .setAutoCancel(true)
+        .build()
+    manager.notify(4102, notification)
+}
+
+private fun directionName(direction: Int): String = when (direction) {
+    1 -> "BUY"
+    -1 -> "SELL"
+    else -> "هیچ‌کدام"
+}
+
+private fun formatPrice(value: Double): String = String.format(Locale.US, "%.5f", value)
+
+private fun formatUtc(timeMillis: Long): String {
+    val format = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+    return format.format(Date(timeMillis)) + " UTC"
+}
 
 @Composable
 private fun CandleChart(
     candles: List<Candle>,
+    emaLines: List<ChartLine>,
+    rectangles: List<StrategyRectangle>,
+    msbLines: List<M5MsbEvent>,
     modifier: Modifier = Modifier
 ) {
     if (candles.isEmpty()) {
-        Box(
-            modifier = modifier.background(
-                Color(0xFF101821)
-            ),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                "هنوز داده‌ای دریافت نشده",
-                color = Color(0xFFB8C4D2),
-                style = MaterialTheme.typography.bodyMedium
-            )
+        Box(modifier = modifier.background(Color(0xFF101821)), contentAlignment = Alignment.Center) {
+            Text("هنوز داده‌ای دریافت نشده", color = Color(0xFFB8C4D2))
         }
-
         return
     }
 
+    val visibleStart = max(candles.size - 60, 0)
+    val visible = candles.drop(visibleStart)
     val gridColor = Color(0xFF344150)
     val risingColor = Color(0xFF26A69A)
     val fallingColor = Color(0xFFEF5350)
 
-    Canvas(
-        modifier = modifier.background(
-            Color(0xFF101821)
-        )
-    ) {
+    Canvas(modifier = modifier.background(Color(0xFF101821))) {
         val left = 8.dp.toPx()
         val rightInset = 76.dp.toPx()
-        val top = 12.dp.toPx()
+        val topInset = 12.dp.toPx()
         val bottomInset = 28.dp.toPx()
-
         val plotRight = size.width - rightInset
         val plotBottom = size.height - bottomInset
+        val plotWidth = (plotRight - left).coerceAtLeast(1f)
+        val plotHeight = (plotBottom - topInset).coerceAtLeast(1f)
+        val stepWidth = plotWidth / visible.size.toFloat()
 
-        val plotWidth =
-            (plotRight - left).coerceAtLeast(1f)
-
-        val plotHeight =
-            (plotBottom - top).coerceAtLeast(1f)
-
-        val rawHigh = candles.maxOf {
-            it.high
+        fun xForIndex(index: Int): Float = left + (index - visibleStart + 0.5f) * stepWidth
+        fun xForTime(time: Long): Float {
+            var lo = 0
+            var hi = candles.lastIndex
+            var best = -1
+            while (lo <= hi) {
+                val mid = (lo + hi) ushr 1
+                if (candles[mid].timeMillis <= time) {
+                    best = mid
+                    lo = mid + 1
+                } else hi = mid - 1
+            }
+            if (best < 0) return left
+            if (best >= candles.lastIndex && time >= candles.last().timeMillis + M15_MS) return plotRight
+            val offsetFraction = ((time - candles[best].timeMillis).toDouble() / M15_MS.toDouble()).coerceIn(0.0, 1.0).toFloat()
+            return left + (best - visibleStart + offsetFraction) * stepWidth
         }
 
-        val rawLow = candles.minOf {
-            it.low
+        fun priceVisible(rect: StrategyRectangle): Boolean {
+            val rightIndex = rect.rightIndex.coerceAtLeast(rect.activationIndex).coerceAtMost(candles.lastIndex)
+            return rightIndex >= visibleStart && rect.leftIndex <= candles.lastIndex
         }
 
-        val rawRange =
-            (rawHigh - rawLow).coerceAtLeast(0.00001)
-
-        val padding = rawRange * 0.04
-        val maxPrice = rawHigh + padding
-        val minPrice = rawLow - padding
-
-        val priceRange =
-            (maxPrice - minPrice).coerceAtLeast(0.00001)
-
-        fun y(price: Double): Float =
-            top +
-                (
-                    ((maxPrice - price) / priceRange).toFloat() *
-                        plotHeight
-                )
-
-        val canvas = drawContext.canvas.nativeCanvas
-
-        val pricePaint = AndroidPaint(
-            AndroidPaint.ANTI_ALIAS_FLAG
-        ).apply {
-            color = android.graphics.Color.LTGRAY
-            textSize = 10.dp.toPx()
-            textAlign = AndroidPaint.Align.LEFT
+        val visibleEmaValues = emaLines.flatMap { line ->
+            line.values.drop(visibleStart).filterNotNull().filter { it.isFinite() }
         }
-
-        val timePaint = AndroidPaint(
-            AndroidPaint.ANTI_ALIAS_FLAG
-        ).apply {
-            color = android.graphics.Color.GRAY
-            textSize = 9.dp.toPx()
-            textAlign = AndroidPaint.Align.LEFT
-        }
+        val visibleRectPrices = rectangles.filter { priceVisible(it) }.flatMap { listOf(it.top, it.bottom) }
+        val visibleMsbPrices = msbLines.filter { it.endTime >= visible.first().timeMillis - M15_MS && it.startTime <= visible.last().timeMillis + M15_MS }.map { it.level }
+        val maxPrice = max(
+            visible.maxOf { it.high },
+            (visibleEmaValues + visibleRectPrices + visibleMsbPrices).maxOrNull() ?: visible.maxOf { it.high }
+        )
+        val minPrice = min(
+            visible.minOf { it.low },
+            (visibleEmaValues + visibleRectPrices + visibleMsbPrices).minOrNull() ?: visible.minOf { it.low }
+        )
+        val range = (maxPrice - minPrice).coerceAtLeast(0.00001)
+        val paddedHigh = maxPrice + range * 0.04
+        val paddedLow = minPrice - range * 0.04
+        val paddedRange = (paddedHigh - paddedLow).coerceAtLeast(0.00001)
+        fun y(price: Double): Float = topInset + ((paddedHigh - price) / paddedRange).toFloat() * plotHeight
 
         for (step in 0..4) {
             val fraction = step / 4f
-            val yy = top + fraction * plotHeight
-
-            drawLine(
-                color = gridColor,
-                start = Offset(left, yy),
-                end = Offset(plotRight, yy),
-                strokeWidth = 1.dp.toPx()
-            )
-
-            val labelPrice =
-                maxPrice - fraction * priceRange
-
-            canvas.drawText(
-                String.format(
-                    Locale.US,
-                    "%.5f",
-                    labelPrice
-                ),
-                plotRight + 5.dp.toPx(),
-                yy + 3.dp.toPx(),
-                pricePaint
+            val yy = topInset + fraction * plotHeight
+            drawLine(color = gridColor, start = Offset(left, yy), end = Offset(plotRight, yy), strokeWidth = 1.dp.toPx())
+            val labelPrice = paddedHigh - fraction * paddedRange
+            drawContext.canvas.nativeCanvas.drawText(
+                String.format(Locale.US, "%.5f", labelPrice), plotRight + 5.dp.toPx(), yy + 3.dp.toPx(),
+                AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.LTGRAY; textSize = 10.dp.toPx() }
             )
         }
 
-        val stepWidth =
-            plotWidth / candles.size.toFloat()
-
-        val bodyWidth =
-            (stepWidth * 0.62f).coerceIn(
-                1.5f,
-                8.dp.toPx()
+        // Draw rectangle backgrounds and borders beneath the candle bodies.
+        for (rect in rectangles) {
+            if (!priceVisible(rect)) continue
+            val x1 = xForTime(candles[rect.leftIndex.coerceIn(0, candles.lastIndex)].timeMillis)
+            val rightIdx = rect.rightIndex.coerceIn(0, candles.lastIndex)
+            val x2 = if (rightIdx == candles.lastIndex && !rect.touched) plotRight else xForIndex(rightIdx) + stepWidth * 0.5f
+            val color = if (rect.direction == 1) Color(0xFF00E676) else Color(0xFFFF1744)
+            val yTop = y(rect.top)
+            val yBottom = y(rect.bottom)
+            drawRect(
+                color = color.copy(alpha = 0.13f),
+                topLeft = Offset(x1, min(yTop, yBottom)),
+                size = Size((x2 - x1).coerceAtLeast(0f), abs(yBottom - yTop))
             )
+            drawLine(color, Offset(x1, yTop), Offset(x2, yTop), 1.5.dp.toPx())
+            drawLine(color, Offset(x1, yBottom), Offset(x2, yBottom), 1.5.dp.toPx())
+            drawLine(color, Offset(x1, yTop), Offset(x1, yBottom), 1.5.dp.toPx())
+            val labelPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+                this.color = if (rect.direction == 1) android.graphics.Color.GREEN else android.graphics.Color.RED
+                textSize = 10.dp.toPx()
+                isFakeBoldText = true
+            }
+            drawContext.canvas.nativeCanvas.drawText(directionName(rect.direction), max(x1 + 3.dp.toPx(), left), min(yTop, yBottom) + 12.dp.toPx(), labelPaint)
+        }
 
-        candles.forEachIndexed { index, candle ->
-            val x =
-                left + (index + 0.5f) * stepWidth
+        // Display detected M5 MSB levels that intersect the visible M15 window.
+        for (msb in msbLines) {
+            if (msb.endTime < visible.first().timeMillis - M15_MS || msb.startTime > visible.last().timeMillis + M15_MS) continue
+            val color = if (msb.direction == 1) Color(0xFF00C853) else Color(0xFFFF1744)
+            val x1 = xForTime(msb.startTime)
+            val x2 = xForTime(msb.endTime)
+            drawLine(color, Offset(min(x1, x2), y(msb.level)), Offset(max(x1, x2), y(msb.level)), 1.6.dp.toPx())
+        }
 
+        // Candles.
+        val bodyWidth = (stepWidth * 0.62f).coerceIn(1.5f, 8.dp.toPx())
+        visible.forEachIndexed { visibleIndex, candle ->
+            val x = left + (visibleIndex + 0.5f) * stepWidth
             val highY = y(candle.high)
             val lowY = y(candle.low)
             val openY = y(candle.open)
             val closeY = y(candle.close)
-
-            val rising =
-                candle.close >= candle.open
-
-            val candleColor =
-                if (rising) risingColor else fallingColor
-
-            drawLine(
-                color = candleColor,
-                start = Offset(x, highY),
-                end = Offset(x, lowY),
-                strokeWidth = 1.dp.toPx()
-            )
-
-            val bodyTop = minOf(openY, closeY)
-
-            val bodyHeight =
-                (maxOf(openY, closeY) - bodyTop)
-                    .coerceAtLeast(2.dp.toPx())
-
-            drawRect(
-                color = candleColor,
-                topLeft = Offset(
-                    x - bodyWidth / 2f,
-                    bodyTop
-                ),
-                size = Size(
-                    bodyWidth,
-                    bodyHeight
-                )
-            )
+            val candleColor = if (candle.close >= candle.open) risingColor else fallingColor
+            drawLine(candleColor, Offset(x, highY), Offset(x, lowY), 1.dp.toPx())
+            val bodyTop = min(openY, closeY)
+            val bodyHeight = (max(openY, closeY) - bodyTop).coerceAtLeast(2.dp.toPx())
+            drawRect(candleColor, Offset(x - bodyWidth / 2f, bodyTop), Size(bodyWidth, bodyHeight))
         }
 
-        canvas.drawText(
-            candles.first().time.takeLast(8),
-            left,
-            size.height - 6.dp.toPx(),
-            timePaint
-        )
+        // Moving averages on top of price bars.
+        for (line in emaLines) {
+            val color = Color(line.colorArgb)
+            for (index in max(visibleStart, 1)..candles.lastIndex) {
+                if (index < visibleStart) continue
+                val previous = line.values.getOrNull(index - 1) ?: continue
+                val current = line.values.getOrNull(index) ?: continue
+                if (!previous.isFinite() || !current.isFinite()) continue
+                drawLine(
+                    color = color,
+                    start = Offset(xForIndex(index - 1), y(previous)),
+                    end = Offset(xForIndex(index), y(current)),
+                    strokeWidth = line.widthDp.dp.toPx()
+                )
+            }
+        }
 
-        val finalLabel =
-            candles.last().time.takeLast(8)
-
-        val labelWidth =
-            timePaint.measureText(finalLabel)
-
-        canvas.drawText(
-            finalLabel,
-            (plotRight - labelWidth).coerceAtLeast(left),
-            size.height - 6.dp.toPx(),
-            timePaint
-        )
+        val timePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.GRAY
+            textSize = 9.dp.toPx()
+        }
+        drawContext.canvas.nativeCanvas.drawText(visible.first().time.takeLast(8), left, size.height - 6.dp.toPx(), timePaint)
+        val lastTimeLabel = visible.last().time.takeLast(8)
+        val labelWidth = timePaint.measureText(lastTimeLabel)
+        drawContext.canvas.nativeCanvas.drawText(lastTimeLabel, plotRight - labelWidth, size.height - 6.dp.toPx(), timePaint)
     }
 }
+
+private fun requestedOutputSize(interval: String): Int = when (interval) {
+    "5min" -> 3000
+    "15min" -> 1000
+    else -> 300
+}
+
+private fun urlEncode(value: String): String = URLEncoder.encode(value, "UTF-8")
