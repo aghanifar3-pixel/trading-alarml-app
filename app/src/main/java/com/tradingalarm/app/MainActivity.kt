@@ -372,7 +372,33 @@ private fun TradingAlarmScreen() {
                         append(notificationMessages.joinToString("؛ "))
                     }
                 }
-            } catch (e: Exception) {
+            }
+                            try {
+                    val monitorIntent = Intent(
+                        context,
+                        TradingAlarmService::class.java
+                    )
+
+                    if (Build.VERSION.SDK_INT >=
+                        Build.VERSION_CODES.O
+                    ) {
+                        context.startForegroundService(
+                            monitorIntent
+                        )
+                    } else {
+                        context.startService(
+                            monitorIntent
+                        )
+                    }
+
+                    status += "\nمانیتورینگ پس‌زمینه راه‌اندازی شد."
+
+                } catch (e: Exception) {
+                    status += "\nشروع مانیتورینگ ناموفق بود: ${
+                        e.message ?: "خطای نامشخص"
+                    }"
+                }
+            catch (e: Exception) {
                 audAnalysis = null
                 nzdAnalysis = null
                 lastSuccess = false
