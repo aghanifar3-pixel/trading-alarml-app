@@ -42,6 +42,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -181,6 +182,12 @@ private data class StrategyAnalysis(
     val status: String
 )
 
+private data class PairAnalysisResult(
+    val symbol: String,
+    val analysis: StrategyAnalysis?,
+    val error: String? = null
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -199,7 +206,8 @@ private fun TradingAlarmScreen() {
     val context = LocalContext.current.applicationContext
     var apiKey by remember { mutableStateOf("") }
     var apiKeyLoaded by remember { mutableStateOf(false) }
-    var analysis by remember { mutableStateOf<StrategyAnalysis?>(null) }
+    var audAnalysis by remember { mutableStateOf<StrategyAnalysis?>(null) }
+    var nzdAnalysis by remember { mutableStateOf<StrategyAnalysis?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("کلید API را بارگذاری یا وارد کن؛ سپس «بررسی استراتژی» را بزن.") }
     var lastSuccess by remember { mutableStateOf(false) }
@@ -212,7 +220,7 @@ private fun TradingAlarmScreen() {
             apiKey = ""
         } finally {
             apiKeyLoaded = true
-            if (apiKey.isNotBlank()) status = "کلید ذخیره‌شده بارگذاری شد. آماده بررسی H1، M15 و M5 هستیم."
+            if (apiKey.isNotBlank()) status = "کلید ذخیره‌شده بارگذاری شد. آماده بررسی AUD/USD و NZD/USD هستیم."
         }
     }
 
@@ -229,41 +237,77 @@ private fun TradingAlarmScreen() {
         if (isLoading) return
 
         isLoading = true
-        analysis = null
+        audAnalysis = null
+        nzdAnalysis = null
         lastSuccess = false
-        status = "در حال دریافت H1، M15 و M5 و بررسی منطق Williams / EMA / MSB..."
-        val key = apiKey.trim()
+        status = "در حال دریافت H1، M15 و M5 برای AUD/USD و NZD/USD و بررسی استراتژی..."
+        val apiKeyForRequest = apiKey.trim()
 
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) {
-                    val h1 = fetchCandles(key, "1h", 500)
-                    val m15 = fetchCandles(key, "15min", 3000)
-                    val m5 = fetchCandles(key, "5min", 5000)
-                    analyzeStrategy(h1.candles, m15.candles, m5.candles)
+                val pairResults = withContext(Dispatchers.IO) {
+                    // Each pair is processed independently so an issue with one symbol
+                    // does not prevent the other chart from being shown.
+                    listOf(
+                        analyzePairForSymbol(apiKeyForRequest, "AUD/USD"),
+                        analyzePairForSymbol(apiKeyForRequest, "NZD/USD")
+                    )
                 }
-                withContext(Dispatchers.IO) { saveApiKeySecurely(context, key) }
-                analysis = result
+
+                val successfulPairs = pairResults.filter { it.analysis != null }
+                if (successfulPairs.isEmpty()) {
+                    throw IOException(
+                        pairResults.joinToString(" | ") { "${it.symbol}: ${it.error ?: "داده‌ای دریافت نشد"}" }
+                    )
+                }
+
+                withContext(Dispatchers.IO) {
+                    saveApiKeySecurely(context, apiKeyForRequest)
+                }
+
+                audAnalysis = pairResults.firstOrNull { it.symbol == "AUD/USD" }?.analysis
+                nzdAnalysis = pairResults.firstOrNull { it.symbol == "NZD/USD" }?.analysis
                 lastSuccess = true
 
-                val signal = result.latestSignal
-                val isNewSignal = withContext(Dispatchers.IO) {
-                    registerNewSignalIfNeeded(context, signal, result.m15Candles.lastOrNull()?.timeMillis ?: System.currentTimeMillis())
-                }
-
-                if (isNewSignal && signal != null) {
-                    sendSignalNotification(context, signal)
+                val notificationMessages = mutableListOf<String>()
+                for (pairResult in successfulPairs) {
+                    val pairData = pairResult.analysis ?: continue
+                    val signal = pairData.latestSignal
+                    val latestClosedTime = pairData.m15Candles.lastOrNull()?.timeMillis
+                        ?: System.currentTimeMillis()
+                    val isNewSignal = withContext(Dispatchers.IO) {
+                        registerNewSignalIfNeeded(
+                            context,
+                            pairResult.symbol,
+                            signal,
+                            latestClosedTime
+                        )
+                    }
+                    if (isNewSignal && signal != null) {
+                        sendSignalNotification(context, signal, pairResult.symbol)
+                        notificationMessages.add("${pairResult.symbol}: آلارم ${directionName(signal.direction)}")
+                    }
                 }
 
                 status = buildString {
-                    append("بررسی کامل شد: H1=${result.h1Candles.size}، M15=${result.m15Candles.size}، M5=${result.m5Candles.size} کندل معتبر. ")
-                    append(result.status)
-                    if (isNewSignal && signal != null) {
-                        append(" آلارم جدید ${directionName(signal.direction)} ثبت شد.")
+                    pairResults.forEachIndexed { index, pairResult ->
+                        if (index > 0) append("\n")
+                        val pairData = pairResult.analysis
+                        if (pairData != null) {
+                            append("${pairResult.symbol}: H1=${pairData.h1Candles.size}، M15=${pairData.m15Candles.size}، M5=${pairData.m5Candles.size} کندل؛ ")
+                            append(pairData.status)
+                        } else {
+                            append("${pairResult.symbol}: دریافت ناموفق بود؛ ${pairResult.error ?: "خطای نامشخص"}")
+                        }
+                    }
+                    if (notificationMessages.isNotEmpty()) {
+                        append("\n")
+                        append(notificationMessages.joinToString("؛ "))
                     }
                 }
             } catch (e: Exception) {
-                analysis = null
+                audAnalysis = null
+                nzdAnalysis = null
                 lastSuccess = false
                 status = "بررسی استراتژی ناموفق بود: ${e.message ?: "خطای نامشخص"}"
             } finally {
@@ -293,7 +337,7 @@ private fun TradingAlarmScreen() {
                     Text("Trading Alarm", style = MaterialTheme.typography.headlineMedium, color = MaterialTheme.colorScheme.primary)
                     Text("Williams Gate + EMA 6/11 + M15 Rectangle + M5 MSB", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "اپ در این مرحله هر سه تایم‌فریم را دریافت می‌کند و منطق اسکریپت را بررسی می‌کند. نمودار اصلی M15 است؛ این اپ معامله باز نمی‌کند.",
+                        "منطق استراتژی برای AUD/USD و NZD/USD جداگانه اجرا می‌شود. چارت‌ها پایین صفحه به‌صورت مستقل نمایش داده می‌شوند؛ اپ معامله باز نمی‌کند.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
                     )
@@ -320,8 +364,8 @@ private fun TradingAlarmScreen() {
                         if (isLoading) {
                             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
                             Spacer(Modifier.width(10.dp))
-                            Text("در حال بررسی سه تایم‌فریم...")
-                        } else Text("بررسی استراتژی و به‌روزرسانی چارت")
+                            Text("در حال بررسی داده‌های هر دو نماد...")
+                        } else Text("بررسی هر دو استراتژی و به‌روزرسانی چارت‌ها")
                     }
 
                     Text(
@@ -334,38 +378,15 @@ private fun TradingAlarmScreen() {
                         style = MaterialTheme.typography.bodyMedium
                     )
 
-                    val data = analysis
-                    if (data != null) {
-                        Card(modifier = Modifier.fillMaxWidth()) {
-                            Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text("وضعیت استراتژی", style = MaterialTheme.typography.titleMedium)
-                                Text("Williams Gate: ${if (data.gateReady) "فعال" else "غیرفعال"}")
-                                Text("H1 در انتظار: ${directionName(data.pendingDirection)}")
-                                Text("آخرین M5 MSB: ${directionName(data.latestM5Direction)}")
-                                Text("Williams H1 events در داده دریافت‌شده: ${data.h1WilliamsEvents}")
-                                Text("سیگنال آخر: ${data.latestSignal?.let { directionName(it.direction) + " · " + formatUtc(it.activationTime) } ?: "هنوز مستطیل جدیدی در داده‌های فعلی پیدا نشد"}")
-                            }
+                    audAnalysis?.let { data ->
+                        key("AUD/USD") {
+                            PairAnalysisCard(symbol = "AUD/USD", data = data)
                         }
+                    }
 
-                        Card(modifier = Modifier.fillMaxWidth()) {
-                            Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                    Text("AUD/USD · M15", style = MaterialTheme.typography.titleMedium)
-                                    Text("${data.m15Candles.size} کندل", color = MaterialTheme.colorScheme.secondary)
-                                }
-                                data.m15Candles.lastOrNull()?.let { last ->
-                                    Text("آخرین Close: ${formatPrice(last.close)}", style = MaterialTheme.typography.titleLarge)
-                                    Text("زمان آخرین کندل UTC: ${last.time}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
-                                }
-                                CandleChart(
-                                    candles = data.m15Candles,
-                                    emaLines = data.emaLines,
-                                    rectangles = data.rectangles,
-                                    msbLines = data.msbLines,
-                                    modifier = Modifier.fillMaxWidth().height(360.dp)
-                                )
-                                Text("${data.rectangles.size} مستطیل در داده‌های فعلی پیدا شده است (حداکثر نگهداری: $PAST_SIGNALS_TO_SHOW). برای دیدن گذشته، نمودار را به چپ بکش یا از دکمه‌های تعداد کندل استفاده کن.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
-                            }
+                    nzdAnalysis?.let { data ->
+                        key("NZD/USD") {
+                            PairAnalysisCard(symbol = "NZD/USD", data = data)
                         }
                     }
 
@@ -373,6 +394,86 @@ private fun TradingAlarmScreen() {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun PairAnalysisCard(
+    symbol: String,
+    data: StrategyAnalysis
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text("وضعیت استراتژی · $symbol", style = MaterialTheme.typography.titleMedium)
+                Text("Williams Gate: ${if (data.gateReady) "فعال" else "غیرفعال"}")
+                Text("H1 در انتظار: ${directionName(data.pendingDirection)}")
+                Text("آخرین M5 MSB: ${directionName(data.latestM5Direction)}")
+                Text("Williams H1 events در داده دریافت‌شده: ${data.h1WilliamsEvents}")
+                Text("سیگنال آخر: ${data.latestSignal?.let { directionName(it.direction) + " · " + formatUtc(it.activationTime) } ?: "هنوز مستطیل جدیدی در داده‌های فعلی پیدا نشد"}")
+            }
+        }
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("$symbol · M15", style = MaterialTheme.typography.titleMedium)
+                    Text("${data.m15Candles.size} کندل", color = MaterialTheme.colorScheme.secondary)
+                }
+
+                data.m15Candles.lastOrNull()?.let { last ->
+                    Text("آخرین Close: ${formatPrice(last.close)}", style = MaterialTheme.typography.titleLarge)
+                    Text("زمان آخرین کندل UTC: ${last.time}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f))
+                }
+
+                CandleChart(
+                    candles = data.m15Candles,
+                    emaLines = data.emaLines,
+                    rectangles = data.rectangles,
+                    msbLines = data.msbLines,
+                    modifier = Modifier.fillMaxWidth().height(360.dp)
+                )
+                Text(
+                    "${data.rectangles.size} مستطیل در تاریخچه تحلیل‌شده پیدا شد (حداکثر نگهداری: $PAST_SIGNALS_TO_SHOW). از کنترل‌های زیر نمودار برای جابه‌جایی و بزرگ‌نمایی تاریخچه استفاده کن.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
+                )
+            }
+        }
+    }
+}
+
+private fun analyzePairForSymbol(
+    apiKey: String,
+    symbol: String
+): PairAnalysisResult {
+    return try {
+        val h1 = fetchCandles(apiKey, symbol, "1h", 500)
+        val m15 = fetchCandles(apiKey, symbol, "15min", 3000)
+        val m5 = fetchCandles(apiKey, symbol, "5min", 5000)
+        PairAnalysisResult(
+            symbol = symbol,
+            analysis = analyzeStrategy(h1.candles, m15.candles, m5.candles)
+        )
+    } catch (e: Exception) {
+        PairAnalysisResult(
+            symbol = symbol,
+            analysis = null,
+            error = e.message ?: "خطای نامشخص"
+        )
     }
 }
 
@@ -391,11 +492,7 @@ private fun analyzeStrategy(
     val m15Closes = m15.map { it.close }
     val m15Ema6 = ema(m15Closes, EMA6_LENGTH)
     val m15Ema11 = ema(m15Closes, EMA11_LENGTH)
-    val ema50 = ema(m15Closes, 50)
-    val ema125 = ema(m15Closes, 125)
-    val ema150 = ema(m15Closes, 150)
     val ema250 = ema(m15Closes, 250)
-    val ema500 = ema(m15Closes, 500)
     val m5EventsByTime = calculateM5MsbEvents(m5, MSB_ZIGZAG_LENGTH, MSB_FIB_FACTOR)
 
     val rectangles = mutableListOf<StrategyRectangle>()
@@ -583,12 +680,8 @@ private fun analyzeStrategy(
     }
 
     val emaLines = listOf(
-        ChartLine("EMA 50", 0xFF2962FF, ema50.map { it as Double? }, 1.35f),
-        ChartLine("EMA 125", 0xFFFF9800, ema125.map { it as Double? }, 1.35f),
-        ChartLine("EMA 150", 0xFF00BCD4, ema150.map { it as Double? }, 1.35f),
-        ChartLine("EMA 250", 0xFFE91E63, ema250.map { it as Double? }, 1.35f),
-        ChartLine("EMA 500", 0xFF9C27B0, ema500.map { it as Double? }, 1.35f),
-        ChartLine("M15 EMA 6", 0xFFFF9800, m15Ema6.mapIndexed { index, value -> if (ema6Workflow[index]) value else null }, 2.0f)
+        ChartLine("EMA 6", 0xFF40E0D0, m15Ema6.mapIndexed { index, value -> if (ema6Workflow[index]) value else null }, 2.2f),
+        ChartLine("EMA 250", 0xFFFF0000, ema250.map { it as Double? }, 2.0f)
     )
 
     val lastWilliamsTime = lastWilliamsH1BarTime
@@ -883,6 +976,7 @@ private fun samePrice(a: Double?, b: Double?): Boolean =
 
 private fun fetchCandles(
     apiKey: String,
+    symbol: String,
     interval: String,
     requestedCount: Int
 ): CandleFetchResult {
@@ -893,7 +987,7 @@ private fun fetchCandles(
     }
 
     val query = listOf(
-        "symbol" to "AUD/USD",
+        "symbol" to symbol,
         "interval" to interval,
         "outputsize" to requestedCount.toString(),
         "timezone" to "UTC",
@@ -1061,29 +1155,33 @@ private fun createNotificationChannel(context: Context) {
 
 private fun registerNewSignalIfNeeded(
     context: Context,
+    symbol: String,
     signal: StrategySignal?,
     latestClosedM15Time: Long
 ): Boolean {
     val prefs = context.getSharedPreferences(SIGNAL_PREFS, Context.MODE_PRIVATE)
-    val baselineSet = prefs.getBoolean(SIGNAL_BASELINE_SET_KEY, false)
-    val previousTime = prefs.getLong(LAST_SIGNAL_TIME_KEY, Long.MIN_VALUE)
+    val safeSymbol = symbol.replace("/", "_").replace(" ", "")
+    val baselineKey = "${SIGNAL_BASELINE_SET_KEY}_$safeSymbol"
+    val lastTimeKey = "${LAST_SIGNAL_TIME_KEY}_$safeSymbol"
+    val baselineSet = prefs.getBoolean(baselineKey, false)
+    val previousTime = prefs.getLong(lastTimeKey, Long.MIN_VALUE)
     if (!baselineSet) {
         // Baseline uses the latest closed M15 candle time, not wall-clock time,
         // so a new signal on the immediately following M15 bar is not skipped.
         prefs.edit()
-            .putBoolean(SIGNAL_BASELINE_SET_KEY, true)
-            .putLong(LAST_SIGNAL_TIME_KEY, signal?.activationTime ?: latestClosedM15Time)
+            .putBoolean(baselineKey, true)
+            .putLong(lastTimeKey, signal?.activationTime ?: latestClosedM15Time)
             .apply()
         return false
     }
     if (signal != null && signal.activationTime > previousTime) {
-        prefs.edit().putLong(LAST_SIGNAL_TIME_KEY, signal.activationTime).apply()
+        prefs.edit().putLong(lastTimeKey, signal.activationTime).apply()
         return true
     }
     return false
 }
 
-private fun sendSignalNotification(context: Context, signal: StrategySignal) {
+private fun sendSignalNotification(context: Context, signal: StrategySignal, symbol: String) {
     if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
     val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1092,7 +1190,7 @@ private fun sendSignalNotification(context: Context, signal: StrategySignal) {
         @Suppress("DEPRECATION")
         Notification.Builder(context)
     }
-    val text = "${directionName(signal.direction)} · AUD/USD · مستطیل M15"
+    val text = "${directionName(signal.direction)} · $symbol · مستطیل M15"
     val notification = builder
         .setSmallIcon(android.R.drawable.ic_dialog_info)
         .setContentTitle("Trading Alarm")
@@ -1100,7 +1198,8 @@ private fun sendSignalNotification(context: Context, signal: StrategySignal) {
         .setStyle(Notification.BigTextStyle().bigText("${text}\nزمان: ${formatUtc(signal.activationTime)}\nقیمت بالا: ${formatPrice(signal.top)} · قیمت پایین: ${formatPrice(signal.bottom)}"))
         .setAutoCancel(true)
         .build()
-    manager.notify(4102, notification)
+    val notificationId = if (symbol == "AUD/USD") 4102 else 4103
+    manager.notify(notificationId, notification)
 }
 
 private fun directionName(direction: Int): String = when (direction) {
@@ -1204,7 +1303,7 @@ private fun CandleChart(
         }
 
         Text(
-            text = "نمایش ${visible.size} از ${candles.size} کندل M15  ·  به چپ بکش تا به گذشته بروی",
+            text = "نمایش ${visible.size} از ${candles.size} کندل M15  ·  انگشت را به چپ بکش تا به کندل‌های جدیدتر برگردی؛ به راست بکش تا به گذشته بروی",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
         )
@@ -1226,8 +1325,9 @@ private fun CandleChart(
                         val barsMoved = (accumulatedDragPx / candleStepPx).toInt()
                         if (barsMoved != 0) {
                             val allowedOffset = (candles.size - effectiveCount).coerceAtLeast(0)
-                            // Dragging the finger left moves the viewport into older candles.
-                            viewEndOffset = (viewEndOffset - barsMoved).coerceIn(0, allowedOffset)
+                            // Finger left (negative drag) moves toward newer candles;
+                            // finger right moves toward older candles.
+                            viewEndOffset = (viewEndOffset + barsMoved).coerceIn(0, allowedOffset)
                             accumulatedDragPx -= barsMoved * candleStepPx
                         }
                     }
