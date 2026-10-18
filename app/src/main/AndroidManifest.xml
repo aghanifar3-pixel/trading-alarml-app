@@ -3,8 +3,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="Trading Alarm"
-        android:theme="@style/Theme.TradingAlarm">
+        android:label="Trading Alarm">
 
         <activity
             android:name=".MainActivity"
