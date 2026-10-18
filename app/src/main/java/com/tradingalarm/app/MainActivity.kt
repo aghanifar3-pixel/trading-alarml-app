@@ -43,10 +43,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -57,13 +57,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.text.SimpleDateFormat
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -83,7 +83,8 @@ private data class Candle(
 
 private data class CandleFetchResult(
     val candles: List<Candle>,
-    val removedOutsideForexSession: Int
+    val removedOutsideForexSession: Int,
+    val requestedCount: Int
 )
 
 private const val PREFS_NAME = "trading_alarm_secure_prefs"
@@ -93,9 +94,7 @@ private const val KEY_ALIAS = "TradingAlarmTwelveDataAesKey"
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            TradingAlarmScreen()
-        }
+        setContent { TradingAlarmScreen() }
     }
 }
 
@@ -105,20 +104,27 @@ private fun TradingAlarmScreen() {
 
     var apiKey by remember { mutableStateOf("") }
     var apiKeyLoaded by remember { mutableStateOf(false) }
+
     var selectedInterval by rememberSaveable {
         mutableStateOf("15min")
     }
+
+    var chartInterval by remember {
+        mutableStateOf<String?>(null)
+    }
+
     var candles by remember {
         mutableStateOf<List<Candle>>(emptyList())
     }
+
     var isLoading by remember {
         mutableStateOf(false)
     }
+
     var status by remember {
-        mutableStateOf(
-            "کلید API را وارد کن و یک بار دریافت را بزن؛ سپس روی همین گوشی ذخیره می‌شود."
-        )
+        mutableStateOf("کلید API را وارد کن و دریافت کندل‌ها را بزن.")
     }
+
     var lastRequestSucceeded by remember {
         mutableStateOf(false)
     }
@@ -134,6 +140,87 @@ private fun TradingAlarmScreen() {
             apiKey = ""
         } finally {
             apiKeyLoaded = true
+
+            if (apiKey.isNotBlank()) {
+                status =
+                    "کلید ذخیره‌شده بارگذاری شد. تایم‌فریم را انتخاب کن یا دریافت را بزن."
+            }
+        }
+    }
+
+    fun requestCandles(interval: String) {
+        selectedInterval = interval
+
+        if (!apiKeyLoaded) {
+            status = "در حال بارگذاری کلید ذخیره‌شده؛ کمی صبر کن."
+            lastRequestSucceeded = false
+            return
+        }
+
+        if (apiKey.isBlank()) {
+            candles = emptyList()
+            chartInterval = null
+            status =
+                "ابتدا API Key را وارد کن؛ پس از دریافت موفق، روی گوشی ذخیره می‌شود."
+            lastRequestSucceeded = false
+            return
+        }
+
+        if (isLoading) return
+
+        // Remove the previous chart immediately when changing timeframes.
+        candles = emptyList()
+        chartInterval = null
+        isLoading = true
+
+        status =
+            "در حال دریافت داده‌های $interval؛ تعداد کندل‌ها افزایش یافته است..."
+
+        lastRequestSucceeded = false
+
+        val keyForRequest = apiKey.trim()
+
+        scope.launch {
+            try {
+                val fetchResult = withContext(Dispatchers.IO) {
+                    fetchCandles(keyForRequest, interval)
+                }
+
+                // Save the API key only after a successful response.
+                withContext(Dispatchers.IO) {
+                    saveApiKeySecurely(appContext, keyForRequest)
+                }
+
+                candles = fetchResult.candles
+                chartInterval = interval
+
+                status = buildString {
+                    append(
+                        "دریافت موفق بود؛ ${fetchResult.candles.size} کندل معتبر " +
+                            "از ${fetchResult.requestedCount} کندل درخواستی."
+                    )
+
+                    if (fetchResult.removedOutsideForexSession > 0) {
+                        append(
+                            " ${fetchResult.removedOutsideForexSession} کندل آخرهفته/خارج از ساعات معمول بازار حذف شد."
+                        )
+                    }
+
+                    append(" کلید API روی گوشی ذخیره شد.")
+                }
+
+                lastRequestSucceeded = true
+            } catch (e: Exception) {
+                candles = emptyList()
+                chartInterval = null
+
+                status =
+                    "دریافت ناموفق بود: ${e.message ?: "خطای نامشخص"}"
+
+                lastRequestSucceeded = false
+            } finally {
+                isLoading = false
+            }
         }
     }
 
@@ -175,7 +262,7 @@ private fun TradingAlarmScreen() {
                     )
 
                     Text(
-                        text = "این نسخه فقط داده قیمت را دریافت و چارت کندلی را نمایش می‌دهد؛ هنوز سیگنال معاملاتی تولید نمی‌کند.",
+                        text = "این نسخه دریافت داده و نمایش کندل را آزمایش می‌کند؛ هنوز سیگنال معاملاتی تولید نمی‌کند.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface
                             .copy(alpha = 0.75f)
@@ -197,10 +284,10 @@ private fun TradingAlarmScreen() {
                             PasswordVisualTransformation(),
                         supportingText = {
                             Text(
-                                if (apiKeyLoaded) {
-                                    "پس از اولین درخواست، کلید روی همین گوشی به‌صورت رمزگذاری‌شده ذخیره می‌شود."
+                                if (apiKeyLoaded && apiKey.isNotBlank()) {
+                                    "کلید ذخیره‌شده بارگذاری شده است."
                                 } else {
-                                    "در حال بررسی کلید ذخیره‌شده..."
+                                    "پس از اولین دریافت موفق، کلید رمزگذاری‌شده روی همین گوشی ذخیره می‌شود."
                                 }
                             )
                         }
@@ -219,85 +306,40 @@ private fun TradingAlarmScreen() {
                         FilterChip(
                             selected = selectedInterval == "5min",
                             onClick = {
-                                selectedInterval = "5min"
+                                requestCandles("5min")
                             },
-                            label = { Text("M5") }
+                            enabled = !isLoading,
+                            label = {
+                                Text("M5")
+                            }
                         )
 
                         FilterChip(
                             selected = selectedInterval == "15min",
                             onClick = {
-                                selectedInterval = "15min"
+                                requestCandles("15min")
                             },
-                            label = { Text("M15") }
+                            enabled = !isLoading,
+                            label = {
+                                Text("M15")
+                            }
                         )
 
                         FilterChip(
                             selected = selectedInterval == "1h",
                             onClick = {
-                                selectedInterval = "1h"
+                                requestCandles("1h")
                             },
-                            label = { Text("H1") }
+                            enabled = !isLoading,
+                            label = {
+                                Text("H1")
+                            }
                         )
                     }
 
                     Button(
                         onClick = {
-                            if (!apiKeyLoaded) {
-                                status =
-                                    "هنوز کلید ذخیره‌شده بارگذاری نشده؛ یک لحظه صبر کن."
-                                lastRequestSucceeded = false
-                            } else if (apiKey.isBlank()) {
-                                status =
-                                    "ابتدا یک API Key معتبر وارد کن. کلید را در چت یا GitHub عمومی نفرست."
-                                lastRequestSucceeded = false
-                            } else {
-                                val keyForRequest = apiKey.trim()
-                                val intervalForRequest = selectedInterval
-
-                                isLoading = true
-                                status =
-                                    "در حال ذخیره امن کلید و دریافت کندل‌های AUD/USD..."
-                                lastRequestSucceeded = false
-
-                                scope.launch {
-                                    try {
-                                        val fetchResult =
-                                            withContext(Dispatchers.IO) {
-                                                saveApiKeySecurely(
-                                                    appContext,
-                                                    keyForRequest
-                                                )
-                                                fetchCandles(
-                                                    keyForRequest,
-                                                    intervalForRequest
-                                                )
-                                            }
-
-                                        candles = fetchResult.candles
-
-                                        status =
-                                            if (
-                                                fetchResult
-                                                    .removedOutsideForexSession > 0
-                                            ) {
-                                                "دریافت موفق بود؛ ${fetchResult.candles.size} کندل معتبر باقی ماند. " +
-                                                    "${fetchResult.removedOutsideForexSession} کندل با زمان خارج از ساعات معمول بازار فارکس حذف شد. " +
-                                                    "کلید API روی گوشی ذخیره شد."
-                                            } else {
-                                                "دریافت موفق بود؛ ${fetchResult.candles.size} کندل دریافت شد. کلید API روی گوشی ذخیره شد."
-                                            }
-
-                                        lastRequestSucceeded = true
-                                    } catch (e: Exception) {
-                                        status =
-                                            "دریافت ناموفق بود: ${e.message ?: "خطای نامشخص"}"
-                                        lastRequestSucceeded = false
-                                    } finally {
-                                        isLoading = false
-                                    }
-                                }
-                            }
+                            requestCandles(selectedInterval)
                         },
                         enabled = !isLoading && apiKeyLoaded,
                         modifier = Modifier.fillMaxWidth()
@@ -343,8 +385,7 @@ private fun TradingAlarmScreen() {
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement =
                                     Arrangement.SpaceBetween,
-                                verticalAlignment =
-                                    Alignment.CenterVertically
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
                                     "AUD/USD",
@@ -352,10 +393,11 @@ private fun TradingAlarmScreen() {
                                 )
 
                                 Text(
-                                    text = when (selectedInterval) {
+                                    text = when (chartInterval) {
                                         "5min" -> "M5"
                                         "15min" -> "M15"
-                                        else -> "H1"
+                                        "1h" -> "H1"
+                                        else -> "بدون داده"
                                     },
                                     color =
                                         MaterialTheme.colorScheme.secondary
@@ -399,9 +441,9 @@ private fun TradingAlarmScreen() {
 
                             Text(
                                 text = if (candles.isEmpty()) {
-                                    "پس از دریافت داده، ۶۰ کندل آخر اینجا نمایش داده می‌شوند."
+                                    "برای نمایش نمودار، دریافت داده را با تایم‌فریم انتخاب‌شده اجرا کن."
                                 } else {
-                                    "نمایش ${candles.takeLast(60).size} کندل از ${candles.size} کندل دریافتی"
+                                    "نمایش ${candles.takeLast(60).size} کندل از ${candles.size} کندل معتبر ${chartInterval ?: ""}"
                                 },
                                 style =
                                     MaterialTheme.typography.bodySmall,
@@ -419,14 +461,22 @@ private fun TradingAlarmScreen() {
     }
 }
 
+private fun requestedOutputSize(interval: String): Int = when (interval) {
+    "5min" -> 1000
+    "15min" -> 500
+    else -> 200
+}
+
 private fun fetchCandles(
     apiKey: String,
     interval: String
 ): CandleFetchResult {
+    val requestedCount = requestedOutputSize(interval)
+
     val query = listOf(
         "symbol" to "AUD/USD",
         "interval" to interval,
-        "outputsize" to "100",
+        "outputsize" to requestedCount.toString(),
         "timezone" to "UTC",
         "format" to "JSON",
         "order" to "ASC",
@@ -435,24 +485,25 @@ private fun fetchCandles(
         "${urlEncode(name)}=${urlEncode(value)}"
     }
 
-    val connection =
-        (URL(
+    val connection = (
+        URL(
             "https://api.twelvedata.com/time_series?$query"
-        ).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15_000
-            readTimeout = 15_000
-            setRequestProperty("Accept", "application/json")
-        }
+        ).openConnection() as HttpURLConnection
+    ).apply {
+        requestMethod = "GET"
+        connectTimeout = 15_000
+        readTimeout = 20_000
+        setRequestProperty("Accept", "application/json")
+    }
 
     try {
         val responseCode = connection.responseCode
-        val stream =
-            if (responseCode in 200..299) {
-                connection.inputStream
-            } else {
-                connection.errorStream
-            }
+
+        val stream = if (responseCode in 200..299) {
+            connection.inputStream
+        } else {
+            connection.errorStream
+        }
 
         val body = stream
             ?.bufferedReader(Charsets.UTF_8)
@@ -488,6 +539,7 @@ private fun fetchCandles(
 
         for (index in 0 until values.length()) {
             val item = values.optJSONObject(index) ?: continue
+
             val time = item.optString("datetime")
             val open =
                 item.optString("open").toDoubleOrNull() ?: continue
@@ -500,14 +552,20 @@ private fun fetchCandles(
 
             if (time.isNotBlank()) {
                 result.add(
-                    Candle(time, open, high, low, close)
+                    Candle(
+                        time = time,
+                        open = open,
+                        high = high,
+                        low = low,
+                        close = close
+                    )
                 )
             }
         }
 
         val sorted = result
             .sortedBy { it.time }
-            .takeLast(100)
+            .takeLast(requestedCount)
 
         if (sorted.isEmpty()) {
             throw IOException(
@@ -515,22 +573,28 @@ private fun fetchCandles(
             )
         }
 
-        // Filter weekend records outside the usual Forex session.
-        val marketCandles =
-            sorted.filter { isWithinUsualForexSession(it.time) }
+        val marketCandles = sorted.filter {
+            isWithinUsualForexSession(it.time)
+        }
 
-        val removedCount =
-            sorted.size - marketCandles.size
+        val removedCount = sorted.size - marketCandles.size
 
         if (marketCandles.isEmpty()) {
+            val sampleTimes = sorted
+                .takeLast(3)
+                .joinToString(", ") { it.time }
+
             throw IOException(
-                "همه کندل‌های API خارج از ساعات معمول بازار فارکس بودند. زمان و داده دریافتی را دوباره بررسی کن."
+                "در $requestedCount کندل دریافتی هیچ کندلی در ساعات معمول بازار پیدا نشد. " +
+                    "آخرین زمان‌های API: $sampleTimes. " +
+                    "این پاسخ را باید بررسی کنیم؛ چارت قبلی پاک شد تا با تایم‌فریم جدید اشتباه نشود."
             )
         }
 
         return CandleFetchResult(
             candles = marketCandles,
-            removedOutsideForexSession = removedCount
+            removedOutsideForexSession = removedCount,
+            requestedCount = requestedCount
         )
     } finally {
         connection.disconnect()
@@ -749,6 +813,7 @@ private fun CandleChart(
                 style = MaterialTheme.typography.bodyMedium
             )
         }
+
         return
     }
 
@@ -793,15 +858,14 @@ private fun CandleChart(
         val priceRange =
             (maxPrice - minPrice).coerceAtLeast(0.00001)
 
-        fun y(price: Double): Float {
-            return top +
+        fun y(price: Double): Float =
+            top +
                 (
                     ((maxPrice - price) / priceRange).toFloat() *
                         plotHeight
-                    )
-        }
+                )
 
-        val nativeCanvas = drawContext.canvas.nativeCanvas
+        val canvas = drawContext.canvas.nativeCanvas
 
         val pricePaint = AndroidPaint(
             AndroidPaint.ANTI_ALIAS_FLAG
@@ -833,7 +897,7 @@ private fun CandleChart(
             val labelPrice =
                 maxPrice - fraction * priceRange
 
-            nativeCanvas.drawText(
+            canvas.drawText(
                 String.format(
                     Locale.US,
                     "%.5f",
@@ -895,7 +959,7 @@ private fun CandleChart(
             )
         }
 
-        nativeCanvas.drawText(
+        canvas.drawText(
             candles.first().time.takeLast(8),
             left,
             size.height - 6.dp.toPx(),
@@ -908,7 +972,7 @@ private fun CandleChart(
         val labelWidth =
             timePaint.measureText(finalLabel)
 
-        nativeCanvas.drawText(
+        canvas.drawText(
             finalLabel,
             (plotRight - labelWidth).coerceAtLeast(left),
             size.height - 6.dp.toPx(),
