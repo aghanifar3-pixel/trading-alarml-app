@@ -15,6 +15,7 @@ import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -52,6 +53,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -103,7 +105,7 @@ private const val WVF_PERCENTILE = 0.90
 private const val MSB_ZIGZAG_LENGTH = 9
 private const val MSB_FIB_FACTOR = 0.33
 private const val M15_SEARCH_BACK_BARS = 500
-private const val PAST_SIGNALS_TO_SHOW = 5
+private const val PAST_SIGNALS_TO_SHOW = 20
 
 private data class Candle(
     val time: String,
@@ -235,9 +237,9 @@ private fun TradingAlarmScreen() {
         scope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
-                    val h1 = fetchCandles(key, "1h", 300)
-                    val m15 = fetchCandles(key, "15min", 1000)
-                    val m5 = fetchCandles(key, "5min", 3000)
+                    val h1 = fetchCandles(key, "1h", 500)
+                    val m15 = fetchCandles(key, "15min", 3000)
+                    val m5 = fetchCandles(key, "5min", 5000)
                     analyzeStrategy(h1.candles, m15.candles, m5.candles)
                 }
                 withContext(Dispatchers.IO) { saveApiKeySecurely(context, key) }
@@ -362,7 +364,7 @@ private fun TradingAlarmScreen() {
                                     msbLines = data.msbLines,
                                     modifier = Modifier.fillMaxWidth().height(360.dp)
                                 )
-                                Text("نمایش ۶۰ کندل M15 اخیر، میانگین‌های متحرک، خطوط MSB و مستطیل‌های فعال/گذشته.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
+                                Text("${data.rectangles.size} مستطیل در داده‌های فعلی پیدا شده است (حداکثر نگهداری: $PAST_SIGNALS_TO_SHOW). برای دیدن گذشته، نمودار را به چپ بکش یا از دکمه‌های تعداد کندل استفاده کن.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f))
                             }
                         }
                     }
@@ -1122,157 +1124,362 @@ private fun CandleChart(
     msbLines: List<M5MsbEvent>,
     modifier: Modifier = Modifier
 ) {
+    var visibleCandleCount by rememberSaveable { mutableStateOf(60) }
+    var viewEndOffset by rememberSaveable { mutableStateOf(0) }
+
+    val firstTime = candles.firstOrNull()?.timeMillis
+    val lastTime = candles.lastOrNull()?.timeMillis
+
+    // Each successful refresh returns the chart to the latest candles.
+    // Manual panning/zoom remains unchanged during ordinary recompositions.
+    LaunchedEffect(candles.size, firstTime, lastTime) {
+        visibleCandleCount = min(60, candles.size).coerceAtLeast(1)
+        viewEndOffset = 0
+    }
+
     if (candles.isEmpty()) {
-        Box(modifier = modifier.background(Color(0xFF101821)), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = modifier.background(Color(0xFF101821)),
+            contentAlignment = Alignment.Center
+        ) {
             Text("هنوز داده‌ای دریافت نشده", color = Color(0xFFB8C4D2))
         }
         return
     }
 
-    val visibleStart = max(candles.size - 60, 0)
-    val visible = candles.drop(visibleStart)
+    val effectiveCount = visibleCandleCount.coerceIn(1, candles.size)
+    val maxEndOffset = (candles.size - effectiveCount).coerceAtLeast(0)
+    val effectiveEndOffset = viewEndOffset.coerceIn(0, maxEndOffset)
+    val visibleEndIndex = (candles.lastIndex - effectiveEndOffset).coerceIn(0, candles.lastIndex)
+    val visibleStart = max(visibleEndIndex - effectiveCount + 1, 0)
+    val visible = candles.subList(visibleStart, visibleEndIndex + 1)
+
     val gridColor = Color(0xFF344150)
     val risingColor = Color(0xFF26A69A)
     val fallingColor = Color(0xFFEF5350)
+    val minCandleCount = min(20, candles.size).coerceAtLeast(1)
 
-    Canvas(modifier = modifier.background(Color(0xFF101821))) {
-        val left = 8.dp.toPx()
-        val rightInset = 76.dp.toPx()
-        val topInset = 12.dp.toPx()
-        val bottomInset = 28.dp.toPx()
-        val plotRight = size.width - rightInset
-        val plotBottom = size.height - bottomInset
-        val plotWidth = (plotRight - left).coerceAtLeast(1f)
-        val plotHeight = (plotBottom - topInset).coerceAtLeast(1f)
-        val stepWidth = plotWidth / visible.size.toFloat()
-
-        fun xForIndex(index: Int): Float = left + (index - visibleStart + 0.5f) * stepWidth
-        fun xForTime(time: Long): Float {
-            var lo = 0
-            var hi = candles.lastIndex
-            var best = -1
-            while (lo <= hi) {
-                val mid = (lo + hi) ushr 1
-                if (candles[mid].timeMillis <= time) {
-                    best = mid
-                    lo = mid + 1
-                } else hi = mid - 1
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(
+                onClick = {
+                    visibleCandleCount = (visibleCandleCount - 20).coerceAtLeast(minCandleCount)
+                    viewEndOffset = viewEndOffset.coerceAtMost(
+                        (candles.size - visibleCandleCount).coerceAtLeast(0)
+                    )
+                },
+                enabled = visibleCandleCount > minCandleCount,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("کندل کمتر")
             }
-            if (best < 0) return left
-            if (best >= candles.lastIndex && time >= candles.last().timeMillis + M15_MS) return plotRight
-            val offsetFraction = ((time - candles[best].timeMillis).toDouble() / M15_MS.toDouble()).coerceIn(0.0, 1.0).toFloat()
-            return left + (best - visibleStart + offsetFraction) * stepWidth
-        }
 
-        fun priceVisible(rect: StrategyRectangle): Boolean {
-            val rightIndex = rect.rightIndex.coerceAtLeast(rect.activationIndex).coerceAtMost(candles.lastIndex)
-            return rightIndex >= visibleStart && rect.leftIndex <= candles.lastIndex
-        }
-
-        val visibleEmaValues = emaLines.flatMap { line ->
-            line.values.drop(visibleStart).filterNotNull().filter { it.isFinite() }
-        }
-        val visibleRectPrices = rectangles.filter { priceVisible(it) }.flatMap { listOf(it.top, it.bottom) }
-        val visibleMsbPrices = msbLines.filter { it.endTime >= visible.first().timeMillis - M15_MS && it.startTime <= visible.last().timeMillis + M15_MS }.map { it.level }
-        val maxPrice = max(
-            visible.maxOf { it.high },
-            (visibleEmaValues + visibleRectPrices + visibleMsbPrices).maxOrNull() ?: visible.maxOf { it.high }
-        )
-        val minPrice = min(
-            visible.minOf { it.low },
-            (visibleEmaValues + visibleRectPrices + visibleMsbPrices).minOrNull() ?: visible.minOf { it.low }
-        )
-        val range = (maxPrice - minPrice).coerceAtLeast(0.00001)
-        val paddedHigh = maxPrice + range * 0.04
-        val paddedLow = minPrice - range * 0.04
-        val paddedRange = (paddedHigh - paddedLow).coerceAtLeast(0.00001)
-        fun y(price: Double): Float = topInset + ((paddedHigh - price) / paddedRange).toFloat() * plotHeight
-
-        for (step in 0..4) {
-            val fraction = step / 4f
-            val yy = topInset + fraction * plotHeight
-            drawLine(color = gridColor, start = Offset(left, yy), end = Offset(plotRight, yy), strokeWidth = 1.dp.toPx())
-            val labelPrice = paddedHigh - fraction * paddedRange
-            drawContext.canvas.nativeCanvas.drawText(
-                String.format(Locale.US, "%.5f", labelPrice), plotRight + 5.dp.toPx(), yy + 3.dp.toPx(),
-                AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.LTGRAY; textSize = 10.dp.toPx() }
-            )
-        }
-
-        // Draw rectangle backgrounds and borders beneath the candle bodies.
-        for (rect in rectangles) {
-            if (!priceVisible(rect)) continue
-            val x1 = xForTime(candles[rect.leftIndex.coerceIn(0, candles.lastIndex)].timeMillis)
-            val rightIdx = rect.rightIndex.coerceIn(0, candles.lastIndex)
-            val x2 = if (rightIdx == candles.lastIndex && !rect.touched) plotRight else xForIndex(rightIdx) + stepWidth * 0.5f
-            val color = if (rect.direction == 1) Color(0xFF00E676) else Color(0xFFFF1744)
-            val yTop = y(rect.top)
-            val yBottom = y(rect.bottom)
-            drawRect(
-                color = color.copy(alpha = 0.13f),
-                topLeft = Offset(x1, min(yTop, yBottom)),
-                size = Size((x2 - x1).coerceAtLeast(0f), abs(yBottom - yTop))
-            )
-            drawLine(color, Offset(x1, yTop), Offset(x2, yTop), 1.5.dp.toPx())
-            drawLine(color, Offset(x1, yBottom), Offset(x2, yBottom), 1.5.dp.toPx())
-            drawLine(color, Offset(x1, yTop), Offset(x1, yBottom), 1.5.dp.toPx())
-            val labelPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-                this.color = if (rect.direction == 1) android.graphics.Color.GREEN else android.graphics.Color.RED
-                textSize = 10.dp.toPx()
-                isFakeBoldText = true
+            Button(
+                onClick = {
+                    visibleCandleCount = (visibleCandleCount + 20).coerceAtMost(candles.size)
+                    viewEndOffset = viewEndOffset.coerceAtMost(
+                        (candles.size - visibleCandleCount).coerceAtLeast(0)
+                    )
+                },
+                enabled = visibleCandleCount < candles.size,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("کندل بیشتر")
             }
-            drawContext.canvas.nativeCanvas.drawText(directionName(rect.direction), max(x1 + 3.dp.toPx(), left), min(yTop, yBottom) + 12.dp.toPx(), labelPaint)
+
+            Button(
+                onClick = { viewEndOffset = 0 },
+                enabled = viewEndOffset > 0,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("آخرین")
+            }
         }
 
-        // Display detected M5 MSB levels that intersect the visible M15 window.
-        for (msb in msbLines) {
-            if (msb.endTime < visible.first().timeMillis - M15_MS || msb.startTime > visible.last().timeMillis + M15_MS) continue
-            val color = if (msb.direction == 1) Color(0xFF00C853) else Color(0xFFFF1744)
-            val x1 = xForTime(msb.startTime)
-            val x2 = xForTime(msb.endTime)
-            drawLine(color, Offset(min(x1, x2), y(msb.level)), Offset(max(x1, x2), y(msb.level)), 1.6.dp.toPx())
-        }
+        Text(
+            text = "نمایش ${visible.size} از ${candles.size} کندل M15  ·  به چپ بکش تا به گذشته بروی",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f)
+        )
 
-        // Candles.
-        val bodyWidth = (stepWidth * 0.62f).coerceIn(1.5f, 8.dp.toPx())
-        visible.forEachIndexed { visibleIndex, candle ->
-            val x = left + (visibleIndex + 0.5f) * stepWidth
-            val highY = y(candle.high)
-            val lowY = y(candle.low)
-            val openY = y(candle.open)
-            val closeY = y(candle.close)
-            val candleColor = if (candle.close >= candle.open) risingColor else fallingColor
-            drawLine(candleColor, Offset(x, highY), Offset(x, lowY), 1.dp.toPx())
-            val bodyTop = min(openY, closeY)
-            val bodyHeight = (max(openY, closeY) - bodyTop).coerceAtLeast(2.dp.toPx())
-            drawRect(candleColor, Offset(x - bodyWidth / 2f, bodyTop), Size(bodyWidth, bodyHeight))
-        }
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .background(Color(0xFF101821))
+                .pointerInput(candles.size, effectiveCount) {
+                    var accumulatedDragPx = 0f
+                    detectHorizontalDragGestures { change, dragAmount ->
+                        change.consume()
+                        val chartWidthPx = (
+                            size.width.toFloat() - 8.dp.toPx() - 76.dp.toPx()
+                        ).coerceAtLeast(1f)
+                        val candleStepPx = chartWidthPx / effectiveCount.toFloat()
+                        accumulatedDragPx += dragAmount.x
+                        val barsMoved = (accumulatedDragPx / candleStepPx).toInt()
+                        if (barsMoved != 0) {
+                            val allowedOffset = (candles.size - effectiveCount).coerceAtLeast(0)
+                            // Dragging the finger left moves the viewport into older candles.
+                            viewEndOffset = (viewEndOffset - barsMoved).coerceIn(0, allowedOffset)
+                            accumulatedDragPx -= barsMoved * candleStepPx
+                        }
+                    }
+                }
+        ) {
+            val left = 8.dp.toPx()
+            val rightInset = 76.dp.toPx()
+            val topInset = 12.dp.toPx()
+            val bottomInset = 28.dp.toPx()
+            val plotRight = size.width - rightInset
+            val plotBottom = size.height - bottomInset
+            val plotWidth = (plotRight - left).coerceAtLeast(1f)
+            val plotHeight = (plotBottom - topInset).coerceAtLeast(1f)
+            val stepWidth = plotWidth / visible.size.toFloat()
 
-        // Moving averages on top of price bars.
-        for (line in emaLines) {
-            val color = Color(line.colorArgb)
-            for (index in max(visibleStart, 1)..candles.lastIndex) {
-                if (index < visibleStart) continue
-                val previous = line.values.getOrNull(index - 1) ?: continue
-                val current = line.values.getOrNull(index) ?: continue
-                if (!previous.isFinite() || !current.isFinite()) continue
+            fun xForIndex(index: Int): Float =
+                left + (index - visibleStart + 0.5f) * stepWidth
+
+            fun xForTime(time: Long): Float {
+                var lo = 0
+                var hi = candles.lastIndex
+                var best = -1
+                while (lo <= hi) {
+                    val mid = (lo + hi) ushr 1
+                    if (candles[mid].timeMillis <= time) {
+                        best = mid
+                        lo = mid + 1
+                    } else {
+                        hi = mid - 1
+                    }
+                }
+                if (best < 0) return left
+                val offsetFraction = (
+                    (time - candles[best].timeMillis).toDouble() / M15_MS.toDouble()
+                ).coerceIn(0.0, 1.0).toFloat()
+                return left + (best - visibleStart + offsetFraction) * stepWidth
+            }
+
+            fun priceVisible(rect: StrategyRectangle): Boolean {
+                val rectRight = rect.rightIndex
+                    .coerceAtLeast(rect.activationIndex)
+                    .coerceAtMost(candles.lastIndex)
+                return rectRight >= visibleStart && rect.leftIndex <= visibleEndIndex
+            }
+
+            val visibleEmaValues = emaLines.flatMap { line ->
+                val from = visibleStart.coerceIn(0, line.values.size)
+                val until = (visibleEndIndex + 1).coerceIn(from, line.values.size)
+                line.values.subList(from, until).filterNotNull().filter { it.isFinite() }
+            }
+
+            val visibleRectPrices = rectangles
+                .filter { priceVisible(it) }
+                .flatMap { listOf(it.top, it.bottom) }
+
+            val visibleMsbPrices = msbLines
+                .filter {
+                    it.endTime >= visible.first().timeMillis - M15_MS &&
+                        it.startTime <= visible.last().timeMillis + M15_MS
+                }
+                .map { it.level }
+
+            val maxPrice = max(
+                visible.maxOf { it.high },
+                (visibleEmaValues + visibleRectPrices + visibleMsbPrices).maxOrNull()
+                    ?: visible.maxOf { it.high }
+            )
+            val minPrice = min(
+                visible.minOf { it.low },
+                (visibleEmaValues + visibleRectPrices + visibleMsbPrices).minOrNull()
+                    ?: visible.minOf { it.low }
+            )
+
+            val range = (maxPrice - minPrice).coerceAtLeast(0.00001)
+            val paddedHigh = maxPrice + range * 0.04
+            val paddedLow = minPrice - range * 0.04
+            val paddedRange = (paddedHigh - paddedLow).coerceAtLeast(0.00001)
+            fun y(price: Double): Float =
+                topInset + ((paddedHigh - price) / paddedRange).toFloat() * plotHeight
+
+            for (step in 0..4) {
+                val fraction = step / 4f
+                val yy = topInset + fraction * plotHeight
                 drawLine(
-                    color = color,
-                    start = Offset(xForIndex(index - 1), y(previous)),
-                    end = Offset(xForIndex(index), y(current)),
-                    strokeWidth = line.widthDp.dp.toPx()
+                    color = gridColor,
+                    start = Offset(left, yy),
+                    end = Offset(plotRight, yy),
+                    strokeWidth = 1.dp.toPx()
+                )
+
+                val labelPrice = paddedHigh - fraction * paddedRange
+                drawContext.canvas.nativeCanvas.drawText(
+                    String.format(Locale.US, "%.5f", labelPrice),
+                    plotRight + 5.dp.toPx(),
+                    yy + 3.dp.toPx(),
+                    AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+                        color = android.graphics.Color.LTGRAY
+                        textSize = 10.dp.toPx()
+                    }
                 )
             }
-        }
 
-        val timePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-            color = android.graphics.Color.GRAY
-            textSize = 9.dp.toPx()
+            // Draw all stored historical rectangles that overlap this viewport.
+            for (rect in rectangles) {
+                if (!priceVisible(rect)) continue
+
+                val rectStartIndex = rect.leftIndex.coerceIn(0, candles.lastIndex)
+                val x1 = if (rectStartIndex < visibleStart) {
+                    left
+                } else {
+                    xForIndex(rectStartIndex)
+                }.coerceIn(left, plotRight)
+
+                val rectEndIndex = rect.rightIndex
+                    .coerceAtLeast(rect.activationIndex)
+                    .coerceIn(0, candles.lastIndex)
+
+                val x2 = if (rectEndIndex >= visibleEndIndex) {
+                    plotRight
+                } else {
+                    (xForIndex(rectEndIndex) + stepWidth * 0.5f).coerceIn(left, plotRight)
+                }
+
+                if (x2 < left || x1 > plotRight || x2 <= x1) continue
+
+                val color = if (rect.direction == 1) {
+                    Color(0xFF00E676)
+                } else {
+                    Color(0xFFFF1744)
+                }
+                val yTop = y(rect.top)
+                val yBottom = y(rect.bottom)
+
+                drawRect(
+                    color = color.copy(alpha = 0.13f),
+                    topLeft = Offset(x1, min(yTop, yBottom)),
+                    size = Size(
+                        (x2 - x1).coerceAtLeast(0f),
+                        abs(yBottom - yTop)
+                    )
+                )
+                drawLine(color, Offset(x1, yTop), Offset(x2, yTop), 1.5.dp.toPx())
+                drawLine(color, Offset(x1, yBottom), Offset(x2, yBottom), 1.5.dp.toPx())
+                drawLine(color, Offset(x1, yTop), Offset(x1, yBottom), 1.5.dp.toPx())
+
+                val labelPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+                    this.color = if (rect.direction == 1) {
+                        android.graphics.Color.GREEN
+                    } else {
+                        android.graphics.Color.RED
+                    }
+                    textSize = 10.dp.toPx()
+                    isFakeBoldText = true
+                }
+                drawContext.canvas.nativeCanvas.drawText(
+                    directionName(rect.direction),
+                    max(x1 + 3.dp.toPx(), left),
+                    min(yTop, yBottom) + 12.dp.toPx(),
+                    labelPaint
+                )
+            }
+
+            // M5 MSB levels intersecting the visible M15 window.
+            for (msb in msbLines) {
+                if (
+                    msb.endTime < visible.first().timeMillis - M15_MS ||
+                    msb.startTime > visible.last().timeMillis + M15_MS
+                ) continue
+
+                val rawX1 = xForTime(msb.startTime)
+                val rawX2 = xForTime(msb.endTime)
+                if (max(rawX1, rawX2) < left || min(rawX1, rawX2) > plotRight) continue
+
+                val color = if (msb.direction == 1) {
+                    Color(0xFF00C853)
+                } else {
+                    Color(0xFFFF1744)
+                }
+                drawLine(
+                    color,
+                    Offset(rawX1.coerceIn(left, plotRight), y(msb.level)),
+                    Offset(rawX2.coerceIn(left, plotRight), y(msb.level)),
+                    1.6.dp.toPx()
+                )
+            }
+
+            // Candles for only the selected historical window.
+            val bodyWidth = (stepWidth * 0.62f).coerceIn(1.5f, 8.dp.toPx())
+            visible.forEachIndexed { visibleIndex, candle ->
+                val x = left + (visibleIndex + 0.5f) * stepWidth
+                val highY = y(candle.high)
+                val lowY = y(candle.low)
+                val openY = y(candle.open)
+                val closeY = y(candle.close)
+                val candleColor = if (candle.close >= candle.open) risingColor else fallingColor
+
+                drawLine(
+                    candleColor,
+                    Offset(x, highY),
+                    Offset(x, lowY),
+                    1.dp.toPx()
+                )
+
+                val bodyTop = min(openY, closeY)
+                val bodyHeight =
+                    (max(openY, closeY) - bodyTop).coerceAtLeast(2.dp.toPx())
+
+                drawRect(
+                    candleColor,
+                    Offset(x - bodyWidth / 2f, bodyTop),
+                    Size(bodyWidth, bodyHeight)
+                )
+            }
+
+            // Moving averages are clipped to the selected historical window.
+            for (line in emaLines) {
+                val color = Color(line.colorArgb)
+                val fromIndex = max(visibleStart, 1)
+                for (index in fromIndex..visibleEndIndex) {
+                    val previous = line.values.getOrNull(index - 1) ?: continue
+                    val current = line.values.getOrNull(index) ?: continue
+                    if (!previous.isFinite() || !current.isFinite()) continue
+
+                    drawLine(
+                        color = color,
+                        start = Offset(xForIndex(index - 1), y(previous)),
+                        end = Offset(xForIndex(index), y(current)),
+                        strokeWidth = line.widthDp.dp.toPx()
+                    )
+                }
+            }
+
+            val timePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+                color = android.graphics.Color.GRAY
+                textSize = 9.dp.toPx()
+            }
+
+            drawContext.canvas.nativeCanvas.drawText(
+                visible.first().time.takeLast(8),
+                left,
+                size.height - 6.dp.toPx(),
+                timePaint
+            )
+            val lastTimeLabel = visible.last().time.takeLast(8)
+            val labelWidth = timePaint.measureText(lastTimeLabel)
+            drawContext.canvas.nativeCanvas.drawText(
+                lastTimeLabel,
+                plotRight - labelWidth,
+                size.height - 6.dp.toPx(),
+                timePaint
+            )
         }
-        drawContext.canvas.nativeCanvas.drawText(visible.first().time.takeLast(8), left, size.height - 6.dp.toPx(), timePaint)
-        val lastTimeLabel = visible.last().time.takeLast(8)
-        val labelWidth = timePaint.measureText(lastTimeLabel)
-        drawContext.canvas.nativeCanvas.drawText(lastTimeLabel, plotRight - labelWidth, size.height - 6.dp.toPx(), timePaint)
     }
 }
 
