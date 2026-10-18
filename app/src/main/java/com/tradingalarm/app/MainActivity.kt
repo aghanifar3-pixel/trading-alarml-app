@@ -93,6 +93,16 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
+import android.app.Service
+import android.os.IBinder
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 private const val PREFS_NAME = "trading_alarm_secure_prefs"
 private const val API_KEY_PREF = "encrypted_twelvedata_api_key"
