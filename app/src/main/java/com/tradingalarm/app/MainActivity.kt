@@ -12,7 +12,6 @@ import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.Uri
 import android.graphics.Paint as AndroidPaint
-import android.widget.ImageView
 import android.os.Build
 import android.os.Bundle
 import android.security.keystore.KeyGenParameterSpec
@@ -23,7 +22,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -63,10 +61,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.LayoutDirection
@@ -399,16 +397,33 @@ private fun TradingAlarmScreen() {
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            AndroidView(
-                                factory = { viewContext ->
-                                    ImageView(viewContext).apply {
-                                        setImageResource(R.mipmap.ic_launcher)
-                                        scaleType = ImageView.ScaleType.FIT_CENTER
-                                        contentDescription = "نشان Trading Alarm"
-                                    }
-                                },
-                                modifier = Modifier.size(108.dp)
-                            )
+                            // Resource-independent in-app brand tile. This avoids
+                            // referencing R.mipmap.ic_launcher when the project has
+                            // not added launcher resources yet.
+                            Box(
+                                modifier = Modifier
+                                    .size(108.dp)
+                                    .background(
+                                        color = Color(0xFF101B28),
+                                        shape = RoundedCornerShape(24.dp)
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        text = "🔔",
+                                        style = MaterialTheme.typography.displayMedium
+                                    )
+                                    Text(
+                                        text = "TA",
+                                        color = Color(0xFF80CBC4),
+                                        style = MaterialTheme.typography.labelLarge
+                                    )
+                                }
+                            }
                             Column(
                                 modifier = Modifier.weight(1f),
                                 verticalArrangement = Arrangement.spacedBy(5.dp)
