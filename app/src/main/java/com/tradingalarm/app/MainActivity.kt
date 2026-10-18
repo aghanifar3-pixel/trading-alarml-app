@@ -1,7 +1,11 @@
 package com.tradingalarm.app
 
+import android.content.Context
 import android.graphics.Paint as AndroidPaint
 import android.os.Bundle
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
@@ -30,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,6 +47,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.LayoutDirection
@@ -51,10 +57,21 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.security.KeyStore
+import java.text.SimpleDateFormat
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 private data class Candle(
     val time: String,
@@ -63,6 +80,15 @@ private data class Candle(
     val low: Double,
     val close: Double
 )
+
+private data class CandleFetchResult(
+    val candles: List<Candle>,
+    val removedOutsideForexSession: Int
+)
+
+private const val PREFS_NAME = "trading_alarm_secure_prefs"
+private const val API_KEY_PREF = "encrypted_twelvedata_api_key"
+private const val KEY_ALIAS = "TradingAlarmTwelveDataAesKey"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,13 +101,41 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun TradingAlarmScreen() {
-    var apiKey by rememberSaveable { mutableStateOf("") }
-    var selectedInterval by rememberSaveable { mutableStateOf("15min") }
-    var candles by remember { mutableStateOf<List<Candle>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf("کلید API را وارد کن و دریافت چارت را بزن.") }
-    var lastRequestSucceeded by remember { mutableStateOf(false) }
+    val appContext = LocalContext.current.applicationContext
+
+    var apiKey by remember { mutableStateOf("") }
+    var apiKeyLoaded by remember { mutableStateOf(false) }
+    var selectedInterval by rememberSaveable {
+        mutableStateOf("15min")
+    }
+    var candles by remember {
+        mutableStateOf<List<Candle>>(emptyList())
+    }
+    var isLoading by remember {
+        mutableStateOf(false)
+    }
+    var status by remember {
+        mutableStateOf(
+            "کلید API را وارد کن و یک بار دریافت را بزن؛ سپس روی همین گوشی ذخیره می‌شود."
+        )
+    }
+    var lastRequestSucceeded by remember {
+        mutableStateOf(false)
+    }
+
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        try {
+            apiKey = withContext(Dispatchers.IO) {
+                loadSavedApiKey(appContext)
+            }
+        } catch (_: Exception) {
+            apiKey = ""
+        } finally {
+            apiKeyLoaded = true
+        }
+    }
 
     val scheme = darkColorScheme(
         primary = Color(0xFF80CBC4),
@@ -95,7 +149,9 @@ private fun TradingAlarmScreen() {
     )
 
     MaterialTheme(colorScheme = scheme) {
-        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+        CompositionLocalProvider(
+            LocalLayoutDirection provides LayoutDirection.Rtl
+        ) {
             Surface(
                 modifier = Modifier.fillMaxSize(),
                 color = MaterialTheme.colorScheme.background
@@ -112,30 +168,49 @@ private fun TradingAlarmScreen() {
                         style = MaterialTheme.typography.headlineMedium,
                         color = MaterialTheme.colorScheme.primary
                     )
+
                     Text(
                         text = "چارت آزمایشی فارکس · AUD/USD",
                         style = MaterialTheme.typography.titleMedium
                     )
+
                     Text(
                         text = "این نسخه فقط داده قیمت را دریافت و چارت کندلی را نمایش می‌دهد؛ هنوز سیگنال معاملاتی تولید نمی‌کند.",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
+                        color = MaterialTheme.colorScheme.onSurface
+                            .copy(alpha = 0.75f)
                     )
 
                     OutlinedTextField(
                         value = apiKey,
                         onValueChange = { apiKey = it },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("کلید API از Twelve Data") },
-                        placeholder = { Text("کلید را اینجا وارد کن") },
+                        enabled = apiKeyLoaded && !isLoading,
+                        label = {
+                            Text("کلید API از Twelve Data")
+                        },
+                        placeholder = {
+                            Text("کلید را اینجا وارد کن")
+                        },
                         singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
+                        visualTransformation =
+                            PasswordVisualTransformation(),
                         supportingText = {
-                            Text("کلید در کد GitHub قرار نمی‌گیرد و در این نسخه ذخیره دائمی نمی‌شود.")
+                            Text(
+                                if (apiKeyLoaded) {
+                                    "پس از اولین درخواست، کلید روی همین گوشی به‌صورت رمزگذاری‌شده ذخیره می‌شود."
+                                } else {
+                                    "در حال بررسی کلید ذخیره‌شده..."
+                                }
+                            )
                         }
                     )
 
-                    Text("تایم‌فریم", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "تایم‌فریم",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -143,42 +218,80 @@ private fun TradingAlarmScreen() {
                     ) {
                         FilterChip(
                             selected = selectedInterval == "5min",
-                            onClick = { selectedInterval = "5min" },
+                            onClick = {
+                                selectedInterval = "5min"
+                            },
                             label = { Text("M5") }
                         )
+
                         FilterChip(
                             selected = selectedInterval == "15min",
-                            onClick = { selectedInterval = "15min" },
+                            onClick = {
+                                selectedInterval = "15min"
+                            },
                             label = { Text("M15") }
                         )
+
                         FilterChip(
                             selected = selectedInterval == "1h",
-                            onClick = { selectedInterval = "1h" },
+                            onClick = {
+                                selectedInterval = "1h"
+                            },
                             label = { Text("H1") }
                         )
                     }
 
                     Button(
                         onClick = {
-                            if (apiKey.isBlank()) {
-                                status = "ابتدا یک API Key معتبر وارد کن. کلید را در چت یا GitHub عمومی نفرست."
+                            if (!apiKeyLoaded) {
+                                status =
+                                    "هنوز کلید ذخیره‌شده بارگذاری نشده؛ یک لحظه صبر کن."
+                                lastRequestSucceeded = false
+                            } else if (apiKey.isBlank()) {
+                                status =
+                                    "ابتدا یک API Key معتبر وارد کن. کلید را در چت یا GitHub عمومی نفرست."
                                 lastRequestSucceeded = false
                             } else {
                                 val keyForRequest = apiKey.trim()
                                 val intervalForRequest = selectedInterval
+
                                 isLoading = true
-                                status = "در حال دریافت کندل‌های AUD/USD از سرور..."
+                                status =
+                                    "در حال ذخیره امن کلید و دریافت کندل‌های AUD/USD..."
                                 lastRequestSucceeded = false
+
                                 scope.launch {
                                     try {
-                                        val freshCandles = withContext(Dispatchers.IO) {
-                                            fetchCandles(keyForRequest, intervalForRequest)
-                                        }
-                                        candles = freshCandles
-                                        status = "دریافت موفق بود؛ ${freshCandles.size} کندل دریافت شد."
+                                        val fetchResult =
+                                            withContext(Dispatchers.IO) {
+                                                saveApiKeySecurely(
+                                                    appContext,
+                                                    keyForRequest
+                                                )
+                                                fetchCandles(
+                                                    keyForRequest,
+                                                    intervalForRequest
+                                                )
+                                            }
+
+                                        candles = fetchResult.candles
+
+                                        status =
+                                            if (
+                                                fetchResult
+                                                    .removedOutsideForexSession > 0
+                                            ) {
+                                                "دریافت موفق بود؛ ${fetchResult.candles.size} کندل معتبر باقی ماند. " +
+                                                    "${fetchResult.removedOutsideForexSession} کندل با زمان خارج از ساعات معمول بازار فارکس حذف شد. " +
+                                                    "کلید API روی گوشی ذخیره شد."
+                                            } else {
+                                                "دریافت موفق بود؛ ${fetchResult.candles.size} کندل دریافت شد. کلید API روی گوشی ذخیره شد."
+                                            }
+
                                         lastRequestSucceeded = true
                                     } catch (e: Exception) {
-                                        status = "دریافت ناموفق بود: ${e.message ?: "خطای نامشخص"}"
+                                        status =
+                                            "دریافت ناموفق بود: ${e.message ?: "خطای نامشخص"}"
                                         lastRequestSucceeded = false
                                     } finally {
                                         isLoading = false
@@ -186,7 +299,7 @@ private fun TradingAlarmScreen() {
                                 }
                             }
                         },
-                        enabled = !isLoading,
+                        enabled = !isLoading && apiKeyLoaded,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         if (isLoading) {
@@ -195,6 +308,7 @@ private fun TradingAlarmScreen() {
                                 strokeWidth = 2.dp,
                                 color = MaterialTheme.colorScheme.onPrimary
                             )
+
                             Spacer(Modifier.width(10.dp))
                             Text("در حال دریافت...")
                         } else {
@@ -205,63 +319,99 @@ private fun TradingAlarmScreen() {
                     Text(
                         text = status,
                         color = when {
-                            isLoading -> MaterialTheme.colorScheme.secondary
-                            lastRequestSucceeded -> MaterialTheme.colorScheme.tertiary
-                            else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
+                            isLoading ->
+                                MaterialTheme.colorScheme.secondary
+
+                            lastRequestSucceeded ->
+                                MaterialTheme.colorScheme.tertiary
+
+                            else ->
+                                MaterialTheme.colorScheme.onSurface
+                                    .copy(alpha = 0.85f)
                         },
                         style = MaterialTheme.typography.bodyMedium
                     )
 
-                    Card(modifier = Modifier.fillMaxWidth()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         Column(
                             modifier = Modifier.padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
+                                horizontalArrangement =
+                                    Arrangement.SpaceBetween,
+                                verticalAlignment =
+                                    Alignment.CenterVertically
                             ) {
-                                Text("AUD/USD", style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    "AUD/USD",
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+
                                 Text(
                                     text = when (selectedInterval) {
                                         "5min" -> "M5"
                                         "15min" -> "M15"
                                         else -> "H1"
                                     },
-                                    color = MaterialTheme.colorScheme.secondary
+                                    color =
+                                        MaterialTheme.colorScheme.secondary
                                 )
                             }
+
                             if (candles.isNotEmpty()) {
                                 val latest = candles.last()
+
                                 Text(
-                                    text = "آخرین Close: ${formatPrice(latest.close)}",
-                                    style = MaterialTheme.typography.titleLarge,
-                                    color = if (latest.close >= latest.open) Color(0xFF80CBC4) else Color(0xFFEF9A9A)
+                                    text =
+                                        "آخرین Close: ${formatPrice(latest.close)}",
+                                    style =
+                                        MaterialTheme.typography.titleLarge,
+                                    color = if (
+                                        latest.close >= latest.open
+                                    ) {
+                                        Color(0xFF80CBC4)
+                                    } else {
+                                        Color(0xFFEF9A9A)
+                                    }
                                 )
+
                                 Text(
-                                    text = "زمان آخرین کندل (UTC): ${latest.time}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                                    text =
+                                        "زمان آخرین کندل (UTC): ${latest.time}",
+                                    style =
+                                        MaterialTheme.typography.bodySmall,
+                                    color =
+                                        MaterialTheme.colorScheme.onSurface
+                                            .copy(alpha = 0.7f)
                                 )
                             }
+
                             CandleChart(
                                 candles = candles.takeLast(60),
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(310.dp)
                             )
+
                             Text(
                                 text = if (candles.isEmpty()) {
                                     "پس از دریافت داده، ۶۰ کندل آخر اینجا نمایش داده می‌شوند."
                                 } else {
                                     "نمایش ${candles.takeLast(60).size} کندل از ${candles.size} کندل دریافتی"
                                 },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
+                                style =
+                                    MaterialTheme.typography.bodySmall,
+                                color =
+                                    MaterialTheme.colorScheme.onSurface
+                                        .copy(alpha = 0.65f)
                             )
                         }
                     }
+
                     Spacer(Modifier.height(8.dp))
                 }
             }
@@ -269,7 +419,10 @@ private fun TradingAlarmScreen() {
     }
 }
 
-private fun fetchCandles(apiKey: String, interval: String): List<Candle> {
+private fun fetchCandles(
+    apiKey: String,
+    interval: String
+): CandleFetchResult {
     val query = listOf(
         "symbol" to "AUD/USD",
         "interval" to interval,
@@ -282,56 +435,312 @@ private fun fetchCandles(apiKey: String, interval: String): List<Candle> {
         "${urlEncode(name)}=${urlEncode(value)}"
     }
 
-    val connection = (URL("https://api.twelvedata.com/time_series?$query").openConnection() as HttpURLConnection).apply {
-        requestMethod = "GET"
-        connectTimeout = 15_000
-        readTimeout = 15_000
-        setRequestProperty("Accept", "application/json")
-    }
+    val connection =
+        (URL(
+            "https://api.twelvedata.com/time_series?$query"
+        ).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 15_000
+            setRequestProperty("Accept", "application/json")
+        }
 
     try {
         val responseCode = connection.responseCode
-        val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
-        val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-        if (body.isBlank()) throw IOException("پاسخ خالی از سرور دریافت شد (HTTP $responseCode).")
+        val stream =
+            if (responseCode in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            }
+
+        val body = stream
+            ?.bufferedReader(Charsets.UTF_8)
+            ?.use { it.readText() }
+            .orEmpty()
+
+        if (body.isBlank()) {
+            throw IOException(
+                "پاسخ خالی از سرور دریافت شد (HTTP $responseCode)."
+            )
+        }
 
         val json = JSONObject(body)
         val values = json.optJSONArray("values")
-        if (responseCode !in 200..299 || values == null || json.optString("status") == "error") {
+
+        if (
+            responseCode !in 200..299 ||
+            values == null ||
+            json.optString("status") == "error"
+        ) {
             val message = json.optString("message")
-                .ifBlank { json.optString("msg") }
-                .ifBlank { "خطای HTTP $responseCode یا پاسخ نامعتبر API" }
+                .ifBlank {
+                    json.optString("msg")
+                }
+                .ifBlank {
+                    "خطای HTTP $responseCode یا پاسخ نامعتبر API"
+                }
+
             throw IOException(message)
         }
 
         val result = mutableListOf<Candle>()
+
         for (index in 0 until values.length()) {
             val item = values.optJSONObject(index) ?: continue
             val time = item.optString("datetime")
-            val open = item.optString("open").toDoubleOrNull() ?: continue
-            val high = item.optString("high").toDoubleOrNull() ?: continue
-            val low = item.optString("low").toDoubleOrNull() ?: continue
-            val close = item.optString("close").toDoubleOrNull() ?: continue
-            if (time.isNotBlank()) result.add(Candle(time, open, high, low, close))
+            val open =
+                item.optString("open").toDoubleOrNull() ?: continue
+            val high =
+                item.optString("high").toDoubleOrNull() ?: continue
+            val low =
+                item.optString("low").toDoubleOrNull() ?: continue
+            val close =
+                item.optString("close").toDoubleOrNull() ?: continue
+
+            if (time.isNotBlank()) {
+                result.add(
+                    Candle(time, open, high, low, close)
+                )
+            }
         }
 
-        val sorted = result.sortedBy { it.time }
-        if (sorted.isEmpty()) throw IOException("API هیچ کندل معتبری برنگرداند؛ نماد، تایم‌فریم یا API Key را بررسی کن.")
-        return sorted.takeLast(100)
+        val sorted = result
+            .sortedBy { it.time }
+            .takeLast(100)
+
+        if (sorted.isEmpty()) {
+            throw IOException(
+                "API هیچ کندل معتبری برنگرداند؛ نماد، تایم‌فریم یا API Key را بررسی کن."
+            )
+        }
+
+        // Filter weekend records outside the usual Forex session.
+        val marketCandles =
+            sorted.filter { isWithinUsualForexSession(it.time) }
+
+        val removedCount =
+            sorted.size - marketCandles.size
+
+        if (marketCandles.isEmpty()) {
+            throw IOException(
+                "همه کندل‌های API خارج از ساعات معمول بازار فارکس بودند. زمان و داده دریافتی را دوباره بررسی کن."
+            )
+        }
+
+        return CandleFetchResult(
+            candles = marketCandles,
+            removedOutsideForexSession = removedCount
+        )
     } finally {
         connection.disconnect()
     }
 }
 
-private fun urlEncode(value: String): String = URLEncoder.encode(value, "UTF-8")
+private fun loadSavedApiKey(context: Context): String {
+    val encrypted = context
+        .getSharedPreferences(
+            PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+        .getString(API_KEY_PREF, null) ?: return ""
 
-private fun formatPrice(value: Double): String = String.format(Locale.US, "%.5f", value)
+    return try {
+        decryptApiKey(encrypted)
+    } catch (_: Exception) {
+        context
+            .getSharedPreferences(
+                PREFS_NAME,
+                Context.MODE_PRIVATE
+            )
+            .edit()
+            .remove(API_KEY_PREF)
+            .apply()
+
+        ""
+    }
+}
+
+private fun saveApiKeySecurely(
+    context: Context,
+    apiKey: String
+) {
+    if (apiKey.isBlank()) return
+
+    val encrypted = encryptApiKey(apiKey)
+
+    context
+        .getSharedPreferences(
+            PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+        .edit()
+        .putString(API_KEY_PREF, encrypted)
+        .apply()
+}
+
+private fun getOrCreateApiKeySecret(): SecretKey {
+    val keyStore = KeyStore.getInstance("AndroidKeyStore")
+    keyStore.load(null)
+
+    val existing = keyStore.getKey(
+        KEY_ALIAS,
+        null
+    ) as? SecretKey
+
+    if (existing != null) return existing
+
+    val generator = KeyGenerator.getInstance(
+        KeyProperties.KEY_ALGORITHM_AES,
+        "AndroidKeyStore"
+    )
+
+    val spec = KeyGenParameterSpec.Builder(
+        KEY_ALIAS,
+        KeyProperties.PURPOSE_ENCRYPT or
+            KeyProperties.PURPOSE_DECRYPT
+    )
+        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+        .setEncryptionPaddings(
+            KeyProperties.ENCRYPTION_PADDING_NONE
+        )
+        .setRandomizedEncryptionRequired(true)
+        .build()
+
+    generator.init(spec)
+    return generator.generateKey()
+}
+
+private fun encryptApiKey(apiKey: String): String {
+    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+
+    cipher.init(
+        Cipher.ENCRYPT_MODE,
+        getOrCreateApiKeySecret()
+    )
+
+    val iv = cipher.iv
+
+    val encrypted = cipher.doFinal(
+        apiKey.toByteArray(StandardCharsets.UTF_8)
+    )
+
+    val buffer = ByteBuffer.allocate(
+        4 + iv.size + encrypted.size
+    )
+
+    buffer.putInt(iv.size)
+    buffer.put(iv)
+    buffer.put(encrypted)
+
+    return Base64.encodeToString(
+        buffer.array(),
+        Base64.NO_WRAP
+    )
+}
+
+private fun decryptApiKey(encoded: String): String {
+    val allBytes = Base64.decode(
+        encoded,
+        Base64.NO_WRAP
+    )
+
+    val buffer = ByteBuffer.wrap(allBytes)
+
+    if (buffer.remaining() < 5) {
+        throw IOException("کلید ذخیره‌شده معتبر نیست.")
+    }
+
+    val ivLength = buffer.int
+
+    if (
+        ivLength <= 0 ||
+        ivLength > buffer.remaining()
+    ) {
+        throw IOException("داده رمزگذاری‌شده نامعتبر است.")
+    }
+
+    val iv = ByteArray(ivLength)
+    buffer.get(iv)
+
+    val ciphertext = ByteArray(buffer.remaining())
+    buffer.get(ciphertext)
+
+    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+
+    cipher.init(
+        Cipher.DECRYPT_MODE,
+        getOrCreateApiKeySecret(),
+        GCMParameterSpec(128, iv)
+    )
+
+    return String(
+        cipher.doFinal(ciphertext),
+        StandardCharsets.UTF_8
+    )
+}
+
+private fun isWithinUsualForexSession(
+    utcDateTime: String
+): Boolean {
+    return try {
+        val parser = SimpleDateFormat(
+            "yyyy-MM-dd HH:mm:ss",
+            Locale.US
+        ).apply {
+            isLenient = false
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+
+        val parsed: Date =
+            parser.parse(utcDateTime) ?: return false
+
+        val newYork = Calendar.getInstance(
+            TimeZone.getTimeZone("America/New_York"),
+            Locale.US
+        ).apply {
+            time = parsed
+        }
+
+        val day = newYork.get(Calendar.DAY_OF_WEEK)
+
+        val minuteOfDay =
+            newYork.get(Calendar.HOUR_OF_DAY) * 60 +
+                newYork.get(Calendar.MINUTE)
+
+        val closeOrOpenMinute = 17 * 60
+
+        when (day) {
+            Calendar.SATURDAY -> false
+            Calendar.SUNDAY ->
+                minuteOfDay >= closeOrOpenMinute
+
+            Calendar.FRIDAY ->
+                minuteOfDay < closeOrOpenMinute
+
+            else -> true
+        }
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private fun urlEncode(value: String): String =
+    URLEncoder.encode(value, "UTF-8")
+
+private fun formatPrice(value: Double): String =
+    String.format(Locale.US, "%.5f", value)
 
 @Composable
-private fun CandleChart(candles: List<Candle>, modifier: Modifier = Modifier) {
+private fun CandleChart(
+    candles: List<Candle>,
+    modifier: Modifier = Modifier
+) {
     if (candles.isEmpty()) {
         Box(
-            modifier = modifier.background(Color(0xFF101821)),
+            modifier = modifier.background(
+                Color(0xFF101821)
+            ),
             contentAlignment = Alignment.Center
         ) {
             Text(
@@ -347,33 +756,64 @@ private fun CandleChart(candles: List<Candle>, modifier: Modifier = Modifier) {
     val risingColor = Color(0xFF26A69A)
     val fallingColor = Color(0xFFEF5350)
 
-    Canvas(modifier = modifier.background(Color(0xFF101821))) {
+    Canvas(
+        modifier = modifier.background(
+            Color(0xFF101821)
+        )
+    ) {
         val left = 8.dp.toPx()
         val rightInset = 76.dp.toPx()
         val top = 12.dp.toPx()
         val bottomInset = 28.dp.toPx()
+
         val plotRight = size.width - rightInset
         val plotBottom = size.height - bottomInset
-        val plotWidth = (plotRight - left).coerceAtLeast(1f)
-        val plotHeight = (plotBottom - top).coerceAtLeast(1f)
 
-        val rawHigh = candles.maxOf { it.high }
-        val rawLow = candles.minOf { it.low }
-        val rawRange = (rawHigh - rawLow).coerceAtLeast(0.00001)
+        val plotWidth =
+            (plotRight - left).coerceAtLeast(1f)
+
+        val plotHeight =
+            (plotBottom - top).coerceAtLeast(1f)
+
+        val rawHigh = candles.maxOf {
+            it.high
+        }
+
+        val rawLow = candles.minOf {
+            it.low
+        }
+
+        val rawRange =
+            (rawHigh - rawLow).coerceAtLeast(0.00001)
+
         val padding = rawRange * 0.04
         val maxPrice = rawHigh + padding
         val minPrice = rawLow - padding
-        val priceRange = (maxPrice - minPrice).coerceAtLeast(0.00001)
 
-        fun y(price: Double): Float = top + (((maxPrice - price) / priceRange).toFloat() * plotHeight)
+        val priceRange =
+            (maxPrice - minPrice).coerceAtLeast(0.00001)
+
+        fun y(price: Double): Float {
+            return top +
+                (
+                    ((maxPrice - price) / priceRange).toFloat() *
+                        plotHeight
+                    )
+        }
 
         val nativeCanvas = drawContext.canvas.nativeCanvas
-        val pricePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+
+        val pricePaint = AndroidPaint(
+            AndroidPaint.ANTI_ALIAS_FLAG
+        ).apply {
             color = android.graphics.Color.LTGRAY
             textSize = 10.dp.toPx()
             textAlign = AndroidPaint.Align.LEFT
         }
-        val timePaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+
+        val timePaint = AndroidPaint(
+            AndroidPaint.ANTI_ALIAS_FLAG
+        ).apply {
             color = android.graphics.Color.GRAY
             textSize = 9.dp.toPx()
             textAlign = AndroidPaint.Align.LEFT
@@ -382,31 +822,52 @@ private fun CandleChart(candles: List<Candle>, modifier: Modifier = Modifier) {
         for (step in 0..4) {
             val fraction = step / 4f
             val yy = top + fraction * plotHeight
+
             drawLine(
                 color = gridColor,
                 start = Offset(left, yy),
                 end = Offset(plotRight, yy),
                 strokeWidth = 1.dp.toPx()
             )
-            val labelPrice = maxPrice - fraction * priceRange
+
+            val labelPrice =
+                maxPrice - fraction * priceRange
+
             nativeCanvas.drawText(
-                String.format(Locale.US, "%.5f", labelPrice),
+                String.format(
+                    Locale.US,
+                    "%.5f",
+                    labelPrice
+                ),
                 plotRight + 5.dp.toPx(),
                 yy + 3.dp.toPx(),
                 pricePaint
             )
         }
 
-        val stepWidth = plotWidth / candles.size.toFloat()
-        val bodyWidth = (stepWidth * 0.62f).coerceIn(1.5f, 8.dp.toPx())
+        val stepWidth =
+            plotWidth / candles.size.toFloat()
+
+        val bodyWidth =
+            (stepWidth * 0.62f).coerceIn(
+                1.5f,
+                8.dp.toPx()
+            )
+
         candles.forEachIndexed { index, candle ->
-            val x = left + (index + 0.5f) * stepWidth
+            val x =
+                left + (index + 0.5f) * stepWidth
+
             val highY = y(candle.high)
             val lowY = y(candle.low)
             val openY = y(candle.open)
             val closeY = y(candle.close)
-            val rising = candle.close >= candle.open
-            val candleColor = if (rising) risingColor else fallingColor
+
+            val rising =
+                candle.close >= candle.open
+
+            val candleColor =
+                if (rising) risingColor else fallingColor
 
             drawLine(
                 color = candleColor,
@@ -414,18 +875,44 @@ private fun CandleChart(candles: List<Candle>, modifier: Modifier = Modifier) {
                 end = Offset(x, lowY),
                 strokeWidth = 1.dp.toPx()
             )
+
             val bodyTop = minOf(openY, closeY)
-            val bodyHeight = (maxOf(openY, closeY) - bodyTop).coerceAtLeast(2.dp.toPx())
+
+            val bodyHeight =
+                (maxOf(openY, closeY) - bodyTop)
+                    .coerceAtLeast(2.dp.toPx())
+
             drawRect(
                 color = candleColor,
-                topLeft = Offset(x - bodyWidth / 2f, bodyTop),
-                size = Size(bodyWidth, bodyHeight)
+                topLeft = Offset(
+                    x - bodyWidth / 2f,
+                    bodyTop
+                ),
+                size = Size(
+                    bodyWidth,
+                    bodyHeight
+                )
             )
         }
 
-        nativeCanvas.drawText(candles.first().time.takeLast(8), left, size.height - 6.dp.toPx(), timePaint)
-        val finalLabel = candles.last().time.takeLast(8)
-        val labelWidth = timePaint.measureText(finalLabel)
-        nativeCanvas.drawText(finalLabel, (plotRight - labelWidth).coerceAtLeast(left), size.height - 6.dp.toPx(), timePaint)
+        nativeCanvas.drawText(
+            candles.first().time.takeLast(8),
+            left,
+            size.height - 6.dp.toPx(),
+            timePaint
+        )
+
+        val finalLabel =
+            candles.last().time.takeLast(8)
+
+        val labelWidth =
+            timePaint.measureText(finalLabel)
+
+        nativeCanvas.drawText(
+            finalLabel,
+            (plotRight - labelWidth).coerceAtLeast(left),
+            size.height - 6.dp.toPx(),
+            timePaint
+        )
     }
 }
